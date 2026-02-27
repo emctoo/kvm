@@ -21,14 +21,27 @@
       inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    git-hooks = {
+      url = "github:cachix/git-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
+      self,
       nixpkgs,
       pyproject-nix,
       uv2nix,
       pyproject-build-systems,
+      treefmt-nix,
+      git-hooks,
       ...
     }:
     let
@@ -73,6 +86,30 @@
               evdevOverlay
             ]
           )
+      );
+
+      # ── Formatting (treefmt-nix) ─────────────────────────────────────────
+
+      # Evaluate treefmt.nix once per system; the result exposes:
+      #   .config.build.wrapper  — the `treefmt` binary with config baked in
+      #   .config.build.check    — a derivation that fails if files are unformatted
+      treefmtEval = forAllSystems (
+        system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix
+      );
+
+      # ── Pre-commit hooks (git-hooks.nix) ─────────────────────────────────
+
+      # Run treefmt as the sole pre-commit hook so formatting is the single
+      # source of truth (treefmt.nix drives both `nix fmt` and git hooks).
+      preCommitChecks = forAllSystems (
+        system:
+        git-hooks.lib.${system}.run {
+          src = ./.;
+          hooks.treefmt = {
+            enable = true;
+            packageOverrides.treefmt = treefmtEval.${system}.config.build.wrapper;
+          };
+        }
       );
 
       # ── VM support (x86_64-linux only) ──────────────────────────────────
@@ -156,29 +193,50 @@
       # Build the two NixOS systems once; reuse in both nixosConfigurations and packages.
       vmServerSystem = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
-        modules = [ qemuVmModule vmBaseModule vmServerModule ];
+        modules = [
+          qemuVmModule
+          vmBaseModule
+          vmServerModule
+        ];
       };
 
       vmClientSystem = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
-        modules = [ qemuVmModule vmBaseModule vmClientModule ];
+        modules = [
+          qemuVmModule
+          vmBaseModule
+          vmClientModule
+        ];
       };
     in
     {
+      # `nix fmt` — format all files in the repo
+      formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
+
+      checks = forAllSystems (system: {
+        # `nix flake check` — fail if any file is not formatted
+        formatting = treefmtEval.${system}.config.build.check self;
+        # also run the pre-commit suite in CI
+        pre-commit-check = preCommitChecks.${system};
+      });
+
       devShells = forAllSystems (
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           pythonSet = pythonSets.${system}.overrideScope editableOverlay;
           virtualenv = pythonSet.mkVirtualEnv "pykvm-dev-env" workspace.deps.all;
+          preCommit = preCommitChecks.${system};
         in
         {
           default = pkgs.mkShell {
-            packages = [
-              virtualenv
-              pkgs.uv
-              pkgs.linuxHeaders # needed to build evdev from source if no wheel
-            ];
+            packages =
+              [
+                virtualenv
+                pkgs.uv
+                pkgs.linuxHeaders # needed to build evdev from source if no wheel
+              ]
+              ++ preCommit.enabledPackages; # tools required by the pre-commit hooks
 
             env = {
               UV_NO_SYNC = "1";
@@ -189,6 +247,7 @@
             shellHook = ''
               unset PYTHONPATH
               export REPO_ROOT=$(git rev-parse --show-toplevel)
+              ${preCommit.shellHook}
             '';
           };
         }
