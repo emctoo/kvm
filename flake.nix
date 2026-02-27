@@ -64,15 +64,21 @@
           pkgs = nixpkgs.legacyPackages.${system};
           python = pkgs.python312;
 
-          # evdev ships sdist-only; it needs Cython + kernel headers to compile.
+          # evdev ships sdist-only; setup.py has /usr/include hardcoded for the
+          # header search.  Patch it to point at the Nix-provided linuxHeaders,
+          # matching exactly what nixpkgs does for python3Packages.evdev.
           evdevOverlay = _final: prev: {
             evdev = prev.evdev.overrideAttrs (old: {
               nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
-                pkgs.python312Packages.cython
+                _final.setuptools
               ];
               buildInputs = (old.buildInputs or [ ]) ++ [
                 pkgs.linuxHeaders
               ];
+              patchPhase = (old.patchPhase or "") + ''
+                substituteInPlace setup.py \
+                  --replace-fail /usr/include ${pkgs.linuxHeaders}/include
+              '';
             });
           };
         in
