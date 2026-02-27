@@ -7,4 +7,7 @@
 
   # Python — ruff formatter (replaces black)
   programs.ruff-format.enable = true;
+
+  # Justfile
+  programs.just.enable = true;
 }

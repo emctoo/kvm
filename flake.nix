@@ -230,13 +230,13 @@
         in
         {
           default = pkgs.mkShell {
-            packages =
-              [
-                virtualenv
-                pkgs.uv
-                pkgs.linuxHeaders # needed to build evdev from source if no wheel
-              ]
-              ++ preCommit.enabledPackages; # tools required by the pre-commit hooks
+            packages = [
+              virtualenv
+              pkgs.uv
+              pkgs.just
+              pkgs.linuxHeaders # needed to build evdev from source if no wheel
+            ]
+            ++ preCommit.enabledPackages; # tools required by the pre-commit hooks
 
             env = {
               UV_NO_SYNC = "1";
