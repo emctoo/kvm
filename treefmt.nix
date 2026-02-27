@@ -2,11 +2,8 @@
 {
   projectRootFile = "flake.nix";
 
-  # Nix — RFC 166 style (same style used by nixpkgs itself)
-  programs.nixfmt = {
-    enable = true;
-    package = pkgs.nixfmt-rfc-style;
-  };
+  # Nix — RFC 166 style (pkgs.nixfmt is now the RFC-style formatter)
+  programs.nixfmt.enable = true;
 
   # Python — ruff formatter (replaces black)
   programs.ruff-format.enable = true;
