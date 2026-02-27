@@ -51,7 +51,9 @@
       workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
 
       overlay = workspace.mkPyprojectOverlay {
-        sourcePreference = "sdist";
+        # Prefer pre-built wheels where available; packages with no wheel
+        # (e.g. evdev) fall back to sdist automatically.
+        sourcePreference = "wheel";
       };
 
       editableOverlay = workspace.mkEditablePyprojectOverlay {
