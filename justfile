@@ -33,6 +33,24 @@ build:
 update:
     uv lock --upgrade
 
+# ── testing (use inside `nix develop`) ───────────────────────────────────────
+
+# Run all tests (unit + mock integration)
+test *args:
+    pytest {{ args }}
+
+# Run unit tests only
+test-unit:
+    pytest tests/unit
+
+# Run mock integration tests only
+test-integration:
+    pytest tests/integration
+
+# Run the NixOS VM integration test (slow — builds QEMU VMs)
+test-vm:
+    nix build '.#checks.x86_64-linux.vm-integration' -L
+
 # ── running (use inside `nix develop`) ───────────────────────────────────────
 
 # Run pykvm-server; pass extra flags after --  e.g. `just server -- --port 5901`

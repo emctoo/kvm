@@ -7,6 +7,12 @@ dependencies = [
     "evdev>=1.7.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [project.scripts]
 pykvm-server = "pykvm.server:main"
 pykvm-client = "pykvm.client:main"
@@ -14,3 +20,8 @@ pykvm-client = "pykvm.client:main"
 [build-system]
 requires = ["uv_build>=0.6.0,<0.7.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

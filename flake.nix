@@ -219,12 +219,94 @@
       # `nix fmt` — format all files in the repo
       formatter = forAllSystems (system: treefmtEval.${system}.config.build.wrapper);
 
-      checks = forAllSystems (system: {
-        # `nix flake check` — fail if any file is not formatted
-        formatting = treefmtEval.${system}.config.build.check self;
-        # also run the pre-commit suite in CI
-        pre-commit-check = preCommitChecks.${system};
-      });
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          # `nix flake check` — fail if any file is not formatted
+          formatting = treefmtEval.${system}.config.build.check self;
+          # also run the pre-commit suite in CI
+          pre-commit-check = preCommitChecks.${system};
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") (
+          let
+            # Minimal fake pykvm server: listens on :5900, accepts one client,
+            # sends KEY_A-down + SYN_REPORT, then closes.
+            fakeServerPy = pkgs.writeText "fake-kvm-server.py" ''
+              import socket, struct, time
+              s = socket.socket()
+              s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              s.bind(('0.0.0.0', 5900))
+              s.listen(1)
+              conn, _ = s.accept()
+              conn.sendall(struct.pack('!HHi', 1, 30, 1))   # KEY_A down
+              conn.sendall(struct.pack('!HHi', 0, 0, 0))    # SYN_REPORT
+              time.sleep(0.1)
+              conn.close()
+              s.close()
+            '';
+          in
+          {
+            vm-integration = pkgs.nixosTest {
+              name = "pykvm-integration";
+
+              nodes = {
+                server =
+                  { pkgs, ... }:
+                  {
+                    # Allow the client VM to reach port 5900.
+                    networking.firewall.allowedTCPPorts = [ 5900 ];
+
+                    systemd.services.fake-kvm-server = {
+                      description = "Fake pykvm TCP server (integration test)";
+                      wantedBy = [ "multi-user.target" ];
+                      after = [ "network.target" ];
+                      serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${fakeServerPy}";
+                    };
+                  };
+
+                client =
+                  { ... }:
+                  {
+                    boot.kernelModules = [ "uinput" ];
+
+                    services.udev.extraRules = ''
+                      KERNEL=="uinput",   MODE="0660", GROUP="input"
+                      SUBSYSTEM=="input", MODE="0660", GROUP="input"
+                    '';
+
+                    environment.systemPackages = [ pykvm-pkg ];
+
+                    systemd.services.pykvm-client = {
+                      description = "pykvm client (integration test)";
+                      wantedBy = [ "multi-user.target" ];
+                      after = [ "network.target" ];
+                      serviceConfig = {
+                        ExecStart = "${pykvm-pkg}/bin/pykvm-client --server server --port 5900";
+                        Restart = "on-failure";
+                        RestartSec = "1s";
+                      };
+                    };
+                  };
+              };
+
+              testScript = ''
+                start_all()
+                # Wait until the fake server is accepting connections before
+                # checking the client log — avoids a spurious timeout if the
+                # server starts slowly.
+                server.wait_for_open_port(5900)
+                client.wait_until_succeeds(
+                    "journalctl -u pykvm-client --no-pager | grep 'Server closed'",
+                    timeout=60,
+                )
+              '';
+            };
+          }
+        )
+      );
 
       devShells = forAllSystems (
         system:
