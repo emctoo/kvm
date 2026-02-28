@@ -324,6 +324,11 @@
             xterm
             chromium
           ];
+
+          networking.proxy = {
+            default = "http://192.168.9.34:1081";
+            noProxy = "127.0.0.1,localhost,192.168.9.1,192.168.8.1,mirrors.tuna.tsinghua.edu.cn,*.0x02.cloud";
+          };
         };
 
       # qemu-vm.nix provides virtualisation.{memorySize,qemu,...}; it is not

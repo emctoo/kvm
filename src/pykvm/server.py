@@ -4,14 +4,21 @@ Server: captures physical keyboard/mouse, forwards events over TCP.
 Usage:
     pykvm-server [--host HOST] [--port PORT]
 
-Modes
------
-local  — events are written to local uinput passthrough clones (default).
-remote — events are serialised and sent to the connected client over TCP.
+Slot switching
+--------------
+Press Left-Ctrl + Left-Win + digit to switch the active target:
 
-The hotkey (default: Left-Ctrl + Left-Alt + Tab) toggles between modes.
-On toggle, held keys are synthetically released on the outgoing side to
-prevent stuck keys.
+  +1  →  local       (events go to the server's own uinput devices)
+  +2  →  client 1    (first connected client)
+  +3  →  client 2    (second connected client)
+  …
+
+Multiple clients may be connected simultaneously; only the active slot
+receives events.  When the active client disconnects, the server falls
+back to local mode automatically.
+
+On every slot switch, held keys are synthetically released on the
+outgoing target to prevent stuck keys.
 """
 
 import asyncio
@@ -27,12 +34,6 @@ from pykvm.config import ServerConfig
 log = logging.getLogger(__name__)
 
 _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYSTICK))
-
-# Absolute position codes accepted as touchpad X/Y (single-touch and MT protocol B).
-_TP_X_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_X, getattr(ecodes, "ABS_MT_POSITION_X", None)) if c is not None)
-_TP_Y_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_Y, getattr(ecodes, "ABS_MT_POSITION_Y", None)) if c is not None)
-# ABS_MT_TRACKING_ID value -1 signals finger lift in type-B multitouch.
-_ABS_MT_TRACKING_ID: int | None = getattr(ecodes, "ABS_MT_TRACKING_ID", None)
 
 # Touchpad-only button codes that the virtual mouse doesn't understand.
 _TOUCHPAD_ONLY_BTNS: frozenset[int] = frozenset(
@@ -53,6 +54,15 @@ _TOUCHPAD_ONLY_BTNS: frozenset[int] = frozenset(
     if (c := getattr(ecodes, name, None)) is not None
 )
 
+# Absolute position codes accepted as touchpad X/Y (single-touch and MT protocol B).
+_TP_X_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_X, getattr(ecodes, "ABS_MT_POSITION_X", None)) if c is not None)
+_TP_Y_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_Y, getattr(ecodes, "ABS_MT_POSITION_Y", None)) if c is not None)
+# ABS_MT_TRACKING_ID value -1 signals finger lift in type-B multitouch.
+_ABS_MT_TRACKING_ID: int | None = getattr(ecodes, "ABS_MT_TRACKING_ID", None)
+
+# Digit key → digit value (1-9).  Used to detect slot-switch combos.
+_DIGIT_TO_NUM: dict[int, int] = {getattr(ecodes, f"KEY_{i}"): i for i in range(1, 10) if hasattr(ecodes, f"KEY_{i}")}
+
 _VAL = {0: "up", 1: "dn", 2: "rp"}
 
 
@@ -66,10 +76,7 @@ async def run(cfg: ServerConfig) -> None:
     keyboards = devices.find_keyboards()
     mice = devices.find_mice()
 
-    # Deduplicate by path: a device that has both EV_KEY and EV_REL (e.g. a
-    # keyboard with a scroll wheel or trackpoint) appears in both lists.
-    # Keep only one InputDevice per path and close the redundant file
-    # descriptor, otherwise we would attempt to grab the same device twice.
+    # Deduplicate by path (a device with both EV_KEY and EV_REL appears twice).
     seen: dict[str, InputDevice] = {}
     for dev in keyboards + mice:
         if dev.path in seen:
@@ -113,18 +120,18 @@ async def run(cfg: ServerConfig) -> None:
     all_devs = grabbed
 
     # ── shared mutable state ─────────────────────────────────────────────────
-    # All device tasks run in the same event loop (single-threaded), so no
-    # locking is needed for reads.  Assignments are only made at await points
-    # where only one task is active, which is safe in asyncio.
-    mode: str = "local"
+    # current: active slot — 0 = local, N = connected client N.
+    # clients: slot → StreamWriter for each connected client.
+    current: int = 0
+    clients: dict[int, asyncio.StreamWriter] = {}
+
     held_keys: set[int] = set()
     last_local_target = vkbd
-    writer: asyncio.StreamWriter | None = None
-    # Running mouse position for debug logging; reset each time remote mode starts.
+
+    # Running pointer position for debug logging; reset on each slot switch.
     mouse_x: int = 0
     mouse_y: int = 0
-    # Touchpad ABS tracking: last reported absolute position (None = not yet seen).
-    # Accumulated deltas are emitted as EV_REL on EV_SYN.
+    # Touchpad ABS tracking: last reported absolute position (None = finger up).
     _tp_x: int | None = None
     _tp_y: int | None = None
     _tp_dx: int = 0
@@ -139,18 +146,20 @@ async def run(cfg: ServerConfig) -> None:
         if ev.type == ecodes.EV_SYN:
             last_local_target.write(ev.type, ev.code, ev.value)
         else:
-            target = vmouse if _is_mouse(ev) else vkbd
-            last_local_target = target
-            target.write(ev.type, ev.code, ev.value)
+            vdev = vmouse if _is_mouse(ev) else vkbd
+            last_local_target = vdev
+            vdev.write(ev.type, ev.code, ev.value)
 
     def _write_remote(ev) -> None:
-        if writer is not None:
-            writer.write(protocol.pack(protocol.RawEvent(ev.type, ev.code, ev.value)))
+        w = clients.get(current)
+        if w is not None:
+            w.write(protocol.pack(protocol.RawEvent(ev.type, ev.code, ev.value)))
 
     async def _flush_remote() -> None:
-        if writer is not None:
+        w = clients.get(current)
+        if w is not None:
             try:
-                await writer.drain()
+                await w.drain()
             except OSError:
                 pass  # disconnect is handled in _handle_client
 
@@ -161,45 +170,52 @@ async def run(cfg: ServerConfig) -> None:
         if held_keys:
             vkbd.write(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
 
-    async def _release_held_remote() -> None:
+    async def _release_held_on(w: asyncio.StreamWriter) -> None:
+        """Release all held keys on a specific remote writer."""
         for code in list(held_keys):
-            _write_remote(protocol.RawEvent(ecodes.EV_KEY, code, 0))
+            w.write(protocol.pack(protocol.RawEvent(ecodes.EV_KEY, code, 0)))
         if held_keys:
-            _write_remote(protocol.RawEvent(ecodes.EV_SYN, ecodes.SYN_REPORT, 0))
-            await _flush_remote()
+            w.write(protocol.pack(protocol.RawEvent(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)))
+            try:
+                await w.drain()
+            except OSError:
+                pass
 
-    # ── mode toggle ──────────────────────────────────────────────────────────
-    async def _toggle() -> None:
-        nonlocal mode, mouse_x, mouse_y, _tp_x, _tp_y, _tp_dx, _tp_dy
-        if mode == "local":
+    # ── slot switch ──────────────────────────────────────────────────────────
+    async def _switch(new_slot: int) -> None:
+        nonlocal current, mouse_x, mouse_y, _tp_x, _tp_y, _tp_dx, _tp_dy
+        if new_slot == current:
+            return
+        # Release held keys on the outgoing target.
+        if current == 0:
             _release_held_local()
-            held_keys.clear()
-            mouse_x = 0
-            mouse_y = 0
-            _tp_x = None
-            _tp_y = None
-            _tp_dx = 0
-            _tp_dy = 0
-            mode = "remote"
-            log.info("→ remote")
         else:
-            await _release_held_remote()
-            held_keys.clear()
-            mode = "local"
-            log.info("→ local")
+            w = clients.get(current)
+            if w is not None:
+                await _release_held_on(w)
+        held_keys.clear()
+        # Reset pointer tracking for the new target.
+        mouse_x = 0
+        mouse_y = 0
+        _tp_x = None
+        _tp_y = None
+        _tp_dx = 0
+        _tp_dy = 0
+        current = new_slot
+        if new_slot == 0:
+            log.info("→ local  (clients: %s)", list(clients) or "none")
+        else:
+            log.info("→ client %d  (clients: %s)", new_slot, list(clients))
 
     # ── per-device read loop ─────────────────────────────────────────────────
     async def _read_device(dev: InputDevice) -> None:
         nonlocal mouse_x, mouse_y, _tp_x, _tp_y, _tp_dx, _tp_dy
         try:
             async for ev in dev.async_read_loop():
-                # Maintain held-key set for hotkey detection and stuck-key release.
                 if ev.type == ecodes.EV_KEY:
                     # Drop touchpad-only buttons before any further processing.
                     if ev.code in _TOUCHPAD_ONLY_BTNS:
                         if ev.code == ecodes.BTN_TOUCH and ev.value == 0:
-                            # Finger lifted — reset touchpad position so next touch
-                            # doesn't produce a large jump.
                             _tp_x = None
                             _tp_y = None
                         continue
@@ -209,19 +225,24 @@ async def run(cfg: ServerConfig) -> None:
                     elif ev.value == 0:  # key up
                         held_keys.discard(ev.code)
 
-                    # Hotkey fires when the last key of the combo is pressed.
-                    if ev.value == 1 and ev.code in cfg.hotkey and cfg.hotkey.issubset(held_keys):
-                        await _toggle()
-                        continue  # swallow the triggering key press
+                    # Slot-switch hotkey: switch_mods + digit 1-9.
+                    # Digit 1 → local (slot 0), digit N → client slot N-1.
+                    if ev.value == 1 and ev.code in _DIGIT_TO_NUM and cfg.switch_mods.issubset(held_keys):
+                        new_slot = _DIGIT_TO_NUM[ev.code] - 1  # 1→0, 2→1, 3→2…
+                        if new_slot == 0 or new_slot in clients:
+                            await _switch(new_slot)
+                        else:
+                            log.warning("Slot %d: no client connected", new_slot)
+                        continue  # swallow the triggering digit press
 
-                    log.debug("[%s] kbd %s %s", mode, _key_name(ev.code), _VAL.get(ev.value, ev.value))
+                    log.debug("[%d] kbd %s %s", current, _key_name(ev.code), _VAL.get(ev.value, ev.value))
 
                 elif ev.type == ecodes.EV_REL:
                     if ev.code == ecodes.REL_X:
                         mouse_x += ev.value
                     elif ev.code == ecodes.REL_Y:
                         mouse_y += ev.value
-                    log.debug("[%s] mouse %s %+d  pos(%d,%d)", mode, ecodes.REL.get(ev.code, ev.code), ev.value, mouse_x, mouse_y)
+                    log.debug("[%d] mouse %s %+d  pos(%d,%d)", current, ecodes.REL.get(ev.code, ev.code), ev.value, mouse_x, mouse_y)
 
                 elif ev.type == ecodes.EV_ABS:
                     # Touchpad: accumulate deltas; emit synthetic EV_REL on EV_SYN.
@@ -229,40 +250,40 @@ async def run(cfg: ServerConfig) -> None:
                         if _tp_x is not None:
                             _tp_dx += ev.value - _tp_x
                         _tp_x = ev.value
-                        log.debug("[%s] abs X=%d  dx=%+d", mode, ev.value, _tp_dx)
+                        log.debug("[%d] abs X=%d  dx=%+d", current, ev.value, _tp_dx)
                     elif ev.code in _TP_Y_CODES:
                         if _tp_y is not None:
                             _tp_dy += ev.value - _tp_y
                         _tp_y = ev.value
-                        log.debug("[%s] abs Y=%d  dy=%+d", mode, ev.value, _tp_dy)
+                        log.debug("[%d] abs Y=%d  dy=%+d", current, ev.value, _tp_dy)
                     elif ev.code == _ABS_MT_TRACKING_ID and ev.value == -1:
                         # Type-B multitouch: finger lifted — reset position.
                         _tp_x = None
                         _tp_y = None
                     continue  # never forward raw ABS events
 
-                # SYN_MT_REPORT is an internal multitouch sync; skip it entirely.
+                # SYN_MT_REPORT is an internal multitouch sync; skip entirely.
                 if ev.type == ecodes.EV_SYN and ev.code != ecodes.SYN_REPORT:
                     continue
 
-                # EV_SYN SYN_REPORT: flush any accumulated touchpad deltas first.
+                # EV_SYN SYN_REPORT: flush accumulated touchpad deltas first.
                 if ev.type == ecodes.EV_SYN:
                     if _tp_dx or _tp_dy:
                         mouse_x += _tp_dx
                         mouse_y += _tp_dy
-                        log.debug("[%s] touchpad rel(%+d,%+d)  pos(%d,%d)", mode, _tp_dx, _tp_dy, mouse_x, mouse_y)
+                        log.debug("[%d] touchpad rel(%+d,%+d)  pos(%d,%d)", current, _tp_dx, _tp_dy, mouse_x, mouse_y)
                         rel_x = protocol.RawEvent(ecodes.EV_REL, ecodes.REL_X, _tp_dx)
                         rel_y = protocol.RawEvent(ecodes.EV_REL, ecodes.REL_Y, _tp_dy)
                         _tp_dx = 0
                         _tp_dy = 0
-                        if mode == "local":
+                        if current == 0:
                             _route_local(rel_x)
                             _route_local(rel_y)
                         else:
                             _write_remote(rel_x)
                             _write_remote(rel_y)
 
-                if mode == "local":
+                if current == 0:
                     _route_local(ev)
                 else:
                     _write_remote(ev)
@@ -274,33 +295,38 @@ async def run(cfg: ServerConfig) -> None:
 
     # ── TCP server ───────────────────────────────────────────────────────────
     async def _handle_client(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        nonlocal writer, mode
+        nonlocal current
+        # Assign the smallest available slot ≥ 1 so that keys stay stable
+        # across reconnects (slot 1 is always reused once it's free).
+        slot = 1
+        while slot in clients:
+            slot += 1
+        clients[slot] = w
         addr = w.get_extra_info("peername")
-        log.info("Client connected from %s", addr)
-        writer = w
+        mods_names = "+".join(_key_name(c) for c in sorted(cfg.switch_mods))
+        log.info("Client %d connected from %s  →  press %s+%d to switch", slot, addr, mods_names, slot + 1)
         try:
-            # Block until the client closes the connection (we never expect
-            # data from the client; EOF signals disconnect).
+            # Block until EOF (client never sends data; disconnect = EOF).
             await r.read()
         except OSError:
             pass
         finally:
-            log.info("Client disconnected (%s)", addr)
-            writer = None
-            if mode == "remote":
+            log.info("Client %d disconnected (%s)", slot, addr)
+            del clients[slot]
+            if current == slot:
                 _release_held_local()
                 held_keys.clear()
-                mode = "local"
-                log.info("→ local (client gone)")
+                current = 0
+                log.info("→ local (client %d gone)", slot)
             w.close()
             await w.wait_closed()
 
     # ── main loop ────────────────────────────────────────────────────────────
     server = await asyncio.start_server(_handle_client, cfg.host, cfg.port)
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-    hotkey_names = "+".join(_key_name(c) for c in sorted(cfg.hotkey))
-    log.info("Listening on %s  —  mode: local  —  hotkey: %s", addrs, hotkey_names)
-    log.info("Press %s to toggle local ↔ remote", hotkey_names)
+    mods_names = "+".join(_key_name(c) for c in sorted(cfg.switch_mods))
+    log.info("Listening on %s  —  slot: local  —  hotkey: %s+[1-9]", addrs, mods_names)
+    log.info("  %s+1 = local  |  +2 = client 1  |  +3 = client 2  |  …", mods_names)
 
     tasks = [asyncio.create_task(_read_device(d)) for d in all_devs]
     try:

@@ -7,17 +7,16 @@ from dataclasses import dataclass, field
 
 DEFAULT_PORT = 5900
 DEFAULT_HOST = "0.0.0.0"
-# Hotkey to toggle between local and remote mode.
-# Expressed as a frozenset of evdev key codes (EV_KEY codes).
-# Default: Left-Ctrl + Left-Alt + Tab  (codes 29, 56, 15)
-DEFAULT_HOTKEY: frozenset[int] = frozenset({29, 56, 15})
+# Modifier keys held while pressing a digit to switch slots.
+# Default: Left-Ctrl (29) + Left-Win/Meta (125)
+DEFAULT_SWITCH_MODS: frozenset[int] = frozenset({29, 125})
 
 
 @dataclass
 class ServerConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
-    hotkey: frozenset[int] = field(default_factory=lambda: DEFAULT_HOTKEY)
+    switch_mods: frozenset[int] = field(default_factory=lambda: DEFAULT_SWITCH_MODS)
 
 
 @dataclass
