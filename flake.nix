@@ -134,9 +134,17 @@
         boot.kernelModules = [ "uinput" ];
 
         # Allow root (and any process in the input group) to access evdev/uinput.
+        # The ID_INPUT_* attributes are normally set by systemd's 60-input-id.rules
+        # via capability ioctls.  We set them explicitly for the pykvm virtual
+        # devices to avoid a race where udev fires before uinput fully exposes the
+        # capability bits — without ID_INPUT=1, libinput skips the device entirely.
         services.udev.extraRules = ''
-          KERNEL=="uinput",          MODE="0660", GROUP="input"
-          SUBSYSTEM=="input",        MODE="0660", GROUP="input"
+          KERNEL=="uinput",   MODE="0660", GROUP="input"
+          SUBSYSTEM=="input", MODE="0660", GROUP="input"
+          SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pykvm-mouse",    \
+            ENV{ID_INPUT}="1", ENV{ID_INPUT_MOUSE}="1"
+          SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pykvm-keyboard", \
+            ENV{ID_INPUT}="1", ENV{ID_INPUT_KEY}="1", ENV{ID_INPUT_KEYBOARD}="1"
         '';
 
         users.users.root.password = "";
@@ -155,11 +163,13 @@
       vmServerModule = {
         networking.hostName = "kvm-server";
 
-        # Override the default user-networking options to splice in port forwarding.
-        # hostfwd=tcp::15900-:5900 → bind host:15900, forward to guest:5900.
-        virtualisation.qemu.networkingOptions = [
-          "-net nic,netdev=user.0,model=virtio"
-          "-netdev user,id=user.0,hostfwd=tcp::15900-:5900"
+        # Layer a port-forward on top of the default user-mode network.
+        virtualisation.forwardPorts = [
+          {
+            from = "host";
+            host.port = 15900;
+            guest.port = 5900;
+          }
         ];
 
         # Give the VM a virtual keyboard so pykvm-server has a device to grab.
@@ -194,11 +204,133 @@
         };
       };
 
+      # Dev client VM: SSH on host:2222 → VM:22 for code sync and manual runs.
+      # No pykvm-client service — the developer syncs source and runs manually.
+      # PYTHONPATH is pre-set to the sync target so the live source shadows the
+      # installed package without rebuilding the VM.
+      vmDevClientModule =
+        { pkgs, ... }:
+        {
+          networking.hostName = "kvm-dev-client";
+
+          services.openssh = {
+            enable = true;
+            settings.PermitRootLogin = "yes";
+          };
+
+          users.users.root.openssh.authorizedKeys.keys = [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICadLJygz4Im8wrekaV/hNFLDN59iIIObpBu3GYKlIZm maple@a34"
+          ];
+
+          # host:2222 → VM:22  (ssh / rsync)
+          virtualisation.forwardPorts = [
+            {
+              from = "host";
+              host.port = 2222;
+              guest.port = 22;
+            }
+          ];
+
+          # Synced source takes precedence over the installed pykvm package.
+          environment.variables.PYTHONPATH = "/root/pykvm/src";
+
+          # evtest lets you monitor the uinput virtual devices over SSH without
+          # needing a graphical display — useful for verifying event injection.
+          environment.systemPackages = [ pkgs.evtest ];
+        };
+
+      # Dev desktop VM: SSH on host:2223 + XFCE desktop so mouse cursor movement
+      # is visible.  No pykvm-client service — the developer runs it manually
+      # (just vm-desktop-run-client or inside the XFCE terminal).
+      #
+      # LightDM blocks root autologin, so a regular 'user' account owns the XFCE
+      # session.  Root SSH still works for code sync and running pykvm-client;
+      # the uinput device created by the root SSH process is picked up by
+      # libinput in the 'user' session via udev.
+      vmDevDesktopModule =
+        { pkgs, lib, ... }:
+        {
+          nix.settings = {
+            experimental-features = [
+              "nix-command"
+              "flakes"
+              "pipe-operators"
+            ];
+            substituters = [
+              "https://nix-community.cachix.org"
+              "https://cache.nixos.org"
+            ];
+            trusted-public-keys = [
+              "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+              "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+            ];
+            auto-optimise-store = true;
+          };
+
+          networking.hostName = "kvm-dev-desktop";
+
+          # More RAM so XFCE is comfortable.
+          virtualisation.memorySize = lib.mkForce 2048;
+
+          services.openssh = {
+            enable = true;
+            settings.PermitRootLogin = "yes";
+          };
+
+          users.users.root.openssh.authorizedKeys.keys = [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICadLJygz4Im8wrekaV/hNFLDN59iIIObpBu3GYKlIZm maple@a34"
+          ];
+
+          # Regular user for the XFCE desktop session.
+          # Empty password so LightDM can log in automatically.
+          users.users."x" = {
+            isNormalUser = true;
+            password = "x";
+            # input group: can read /dev/input/eventN for evtest / libinput.
+            extraGroups = [
+              "input"
+              "wheel"
+            ];
+          };
+
+          # host:2223 → VM:22  (separate port so both dev VMs can run at once)
+          virtualisation.forwardPorts = [
+            {
+              from = "host";
+              host.port = 2223;
+              guest.port = 22;
+            }
+          ];
+
+          # Synced source takes precedence over the installed pykvm package.
+          # pykvm-client is run as root via SSH, so PYTHONPATH lives in root's env.
+          environment.variables.PYTHONPATH = "/root/pykvm/src";
+
+          # Lightweight XFCE desktop so mouse cursor movement and clicks are
+          # visible when pykvm-client injects uinput pointer events.
+          services.xserver = {
+            enable = true;
+            desktopManager.xfce.enable = true;
+          };
+
+          # Auto-login 'user' (LightDM does not allow root autologin).
+          services.displayManager.autoLogin = {
+            enable = true;
+            user = "x";
+          };
+
+          environment.systemPackages = with pkgs; [
+            evtest
+            xterm
+            chromium
+          ];
+        };
+
       # qemu-vm.nix provides virtualisation.{memorySize,qemu,...}; it is not
       # part of the default nixosSystem module list and must be imported explicitly.
       qemuVmModule = "${nixpkgs}/nixos/modules/virtualisation/qemu-vm.nix";
 
-      # Build the two NixOS systems once; reuse in both nixosConfigurations and packages.
+      # Build the NixOS systems once; reuse in both nixosConfigurations and packages.
       vmServerSystem = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
@@ -214,6 +346,24 @@
           qemuVmModule
           vmBaseModule
           vmClientModule
+        ];
+      };
+
+      vmDevClientSystem = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          qemuVmModule
+          vmBaseModule
+          vmDevClientModule
+        ];
+      };
+
+      vmDevDesktopSystem = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          qemuVmModule
+          vmBaseModule
+          vmDevDesktopModule
         ];
       };
     in
@@ -251,7 +401,7 @@
             '';
           in
           {
-            vm-integration = pkgs.nixosTest {
+            vm-integration = pkgs.testers.nixosTest {
               name = "pykvm-integration";
 
               nodes = {
@@ -346,6 +496,8 @@
       nixosConfigurations = {
         vm-server = vmServerSystem;
         vm-client = vmClientSystem;
+        vm-dev-client = vmDevClientSystem;
+        vm-dev-desktop = vmDevDesktopSystem;
       };
 
       packages = forAllSystems (
@@ -356,6 +508,8 @@
         // lib.optionalAttrs (system == "x86_64-linux") {
           vm-server = vmServerSystem.config.system.build.vm;
           vm-client = vmClientSystem.config.system.build.vm;
+          vm-dev-client = vmDevClientSystem.config.system.build.vm;
+          vm-dev-desktop = vmDevDesktopSystem.config.system.build.vm;
         }
       );
     };

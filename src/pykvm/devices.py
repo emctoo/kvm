@@ -19,12 +19,26 @@ def find_keyboards() -> list[InputDevice]:
 
 
 def find_mice() -> list[InputDevice]:
-    """Return all devices that have EV_REL (relative pointer movement)."""
+    """Return devices that produce pointer movement: EV_REL mice or EV_ABS touchpads.
+
+    Accepts both single-touch (ABS_X/ABS_Y) and multitouch type-B
+    (ABS_MT_POSITION_X/ABS_MT_POSITION_Y) touchpads.
+    """
+    _mt_x = getattr(ecodes, "ABS_MT_POSITION_X", None)
+    _mt_y = getattr(ecodes, "ABS_MT_POSITION_Y", None)
+
     result = []
     for path in evdev.list_devices():
         dev = InputDevice(path)
-        if ecodes.EV_REL in dev.capabilities():
+        caps = dev.capabilities()
+        if ecodes.EV_REL in caps:
             result.append(dev)
+        elif ecodes.EV_ABS in caps:
+            abs_codes = {code for code, _ in caps[ecodes.EV_ABS]}
+            single = ecodes.ABS_X in abs_codes and ecodes.ABS_Y in abs_codes
+            mt = _mt_x in abs_codes and _mt_y in abs_codes if (_mt_x and _mt_y) else False
+            if single or mt:
+                result.append(dev)
     return result
 
 
@@ -38,17 +52,49 @@ def create_virtual_keyboard() -> UInput:
 
 
 def create_virtual_mouse() -> UInput:
-    """Create a uinput virtual relative-pointer device."""
+    """Create a uinput virtual relative-pointer device.
+
+    INPUT_PROP_POINTER tells libinput to classify this device as a pointer so
+    that X11 / Wayland compositors move the cursor when EV_REL events arrive.
+
+    REL_WHEEL_HI_RES / REL_HWHEEL_HI_RES (added in Linux 4.19) are sent by
+    most modern mice in addition to REL_WHEEL / REL_HWHEEL.  Without them the
+    virtual device silently drops those events, breaking scroll forwarding and
+    occasionally confusing libinput's event accounting.
+
+    BTN_SIDE / BTN_EXTRA / BTN_FORWARD / BTN_BACK cover the extra thumb buttons
+    common on gaming and productivity mice.
+    """
+    # REL_WHEEL_HI_RES = 11, REL_HWHEEL_HI_RES = 12 (Linux 4.19+)
+    hi_res = [
+        c
+        for c in (
+            getattr(ecodes, "REL_WHEEL_HI_RES", None),
+            getattr(ecodes, "REL_HWHEEL_HI_RES", None),
+        )
+        if c is not None
+    ]
+
     return UInput(
         {
-            ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+            ecodes.EV_KEY: [
+                ecodes.BTN_LEFT,
+                ecodes.BTN_RIGHT,
+                ecodes.BTN_MIDDLE,
+                ecodes.BTN_SIDE,
+                ecodes.BTN_EXTRA,
+                ecodes.BTN_FORWARD,
+                ecodes.BTN_BACK,
+            ],
             ecodes.EV_REL: [
                 ecodes.REL_X,
                 ecodes.REL_Y,
                 ecodes.REL_WHEEL,
                 ecodes.REL_HWHEEL,
+                *hi_res,
             ],
         },
         name="pykvm-mouse",
         version=0x1,
+        input_props=[ecodes.INPUT_PROP_POINTER],
     )

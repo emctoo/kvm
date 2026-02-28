@@ -174,7 +174,7 @@ Key NixOS options used:
 | Option | Value | Purpose |
 |---|---|---|
 | `virtualisation.memorySize` | 1024 | 1 GB RAM per VM |
-| `virtualisation.qemu.networkingOptions` | see flake | port forward / user net |
+| `virtualisation.forwardPorts` | see flake | port forward on top of user-mode net |
 | `virtualisation.qemu.options` | `-device virtio-keyboard-pci` | virtual KB in server |
 | `boot.kernelModules` | `["uinput"]` | load uinput on boot |
 | `services.getty.autologinUser` | `"root"` | no login prompt |
@@ -236,3 +236,8 @@ udevadm control --reload-rules
 udevadm trigger
 ls -la /dev/uinput
 ```
+
+### Injected events are not visible in the terminal
+
+This is expected in headless mode.  See [uinput-routing.md](uinput-routing.md)
+for a full explanation and verification steps using `evtest`.
