@@ -3,7 +3,7 @@ Device discovery and virtual device creation.
 """
 
 import evdev
-from evdev import InputDevice, UInput, ecodes
+from evdev import AbsInfo, InputDevice, UInput, ecodes
 
 
 def find_keyboards() -> list[InputDevice]:
@@ -40,6 +40,54 @@ def find_mice() -> list[InputDevice]:
             if single or mt:
                 result.append(dev)
     return result
+
+
+def create_virtual_touchpad(source: InputDevice) -> UInput:
+    """Create a virtual touchpad that mirrors the physical device's capabilities.
+
+    Capabilities (including ABS min/max/resolution ranges) are copied verbatim
+    from the source device so that libinput can classify the virtual touchpad
+    and process gestures — tap-to-click, two-finger scroll, three-finger
+    gestures, etc. — identically to the real hardware.
+
+    Used in local mode so the host desktop retains full touchpad support even
+    while the server has the physical device grabbed.
+    """
+    # EV_SYN is added automatically by UInput; EV_MSC (scan codes) and EV_FF
+    # (force feedback) are not needed for gesture processing.
+    _SKIP = {ecodes.EV_SYN, ecodes.EV_MSC}
+    caps = {ev_type: codes for ev_type, codes in source.capabilities(absinfo=True).items() if ev_type not in _SKIP}
+    return UInput(
+        caps,
+        name="pykvm-touchpad",
+        version=0x1,
+        input_props=[ecodes.INPUT_PROP_POINTER],
+    )
+
+
+def create_virtual_touchpad_from_caps(caps_json: dict) -> UInput:
+    """Create a virtual touchpad on the client from server-provided capabilities JSON.
+
+    The JSON maps ev_type (decimal string) to:
+      EV_ABS (3): [[code, [value, min, max, fuzz, flat, resolution]], ...]
+      other types: [code, ...]
+
+    AbsInfo ranges are reconstructed so libinput classifies the device
+    identically to the physical touchpad on the server.
+    """
+    caps: dict = {}
+    for key, codes in caps_json.items():
+        ev_type = int(key)
+        if ev_type == ecodes.EV_ABS:
+            caps[ev_type] = [(code, AbsInfo(*absinfo)) for code, absinfo in codes]
+        else:
+            caps[ev_type] = codes
+    return UInput(
+        caps,
+        name="pykvm-touchpad",
+        version=0x1,
+        input_props=[ecodes.INPUT_PROP_POINTER],
+    )
 
 
 def create_virtual_keyboard() -> UInput:

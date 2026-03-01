@@ -35,31 +35,6 @@ log = logging.getLogger(__name__)
 
 _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYSTICK))
 
-# Touchpad-only button codes that the virtual mouse doesn't understand.
-_TOUCHPAD_ONLY_BTNS: frozenset[int] = frozenset(
-    c
-    for name in (
-        "BTN_TOUCH",
-        "BTN_TOOL_FINGER",
-        "BTN_TOOL_DOUBLETAP",
-        "BTN_TOOL_TRIPLETAP",
-        "BTN_TOOL_QUADTAP",
-        "BTN_TOOL_QUINTTAP",
-        "BTN_TOOL_PEN",
-        "BTN_TOOL_RUBBER",
-        "BTN_TOOL_BRUSH",
-        "BTN_TOOL_PENCIL",
-        "BTN_TOOL_AIRBRUSH",
-    )
-    if (c := getattr(ecodes, name, None)) is not None
-)
-
-# Absolute position codes accepted as touchpad X/Y (single-touch and MT protocol B).
-_TP_X_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_X, getattr(ecodes, "ABS_MT_POSITION_X", None)) if c is not None)
-_TP_Y_CODES: frozenset[int] = frozenset(c for c in (ecodes.ABS_Y, getattr(ecodes, "ABS_MT_POSITION_Y", None)) if c is not None)
-# ABS_MT_TRACKING_ID value -1 signals finger lift in type-B multitouch.
-_ABS_MT_TRACKING_ID: int | None = getattr(ecodes, "ABS_MT_TRACKING_ID", None)
-
 # Digit key → digit value (1-9).  Used to detect slot-switch combos.
 _DIGIT_TO_NUM: dict[int, int] = {getattr(ecodes, f"KEY_{i}"): i for i in range(1, 10) if hasattr(ecodes, f"KEY_{i}")}
 
@@ -100,6 +75,26 @@ async def run(cfg: ServerConfig) -> None:
 
     vkbd = devices.create_virtual_keyboard()
     vmouse = devices.create_virtual_mouse()
+    # Virtual touchpad for local-mode passthrough.  Created from the first
+    # grabbed touchpad device so its ABS ranges and button layout match the
+    # physical hardware; libinput then processes gestures normally.
+    _tp_sources = [d for d in all_devs if ecodes.EV_ABS in d.capabilities() and ecodes.KEY_A not in d.capabilities().get(ecodes.EV_KEY, [])]
+    vtouchpad = devices.create_virtual_touchpad(_tp_sources[0]) if _tp_sources else None
+    # Serialise touchpad capabilities (ABS ranges + key codes) to JSON for
+    # the client so it can create a matching virtual touchpad.
+    touchpad_caps: dict | None = None
+    if _tp_sources:
+        _SKIP_EV = {ecodes.EV_SYN, ecodes.EV_MSC}
+        raw_caps = _tp_sources[0].capabilities(absinfo=True)
+        _caps_dict: dict = {}
+        for _ev_type, _codes in raw_caps.items():
+            if _ev_type in _SKIP_EV:
+                continue
+            if _ev_type == ecodes.EV_ABS:
+                _caps_dict[str(_ev_type)] = [[c, list(ai)] for c, ai in _codes]
+            else:
+                _caps_dict[str(_ev_type)] = list(_codes)
+        touchpad_caps = _caps_dict
 
     grabbed: list[InputDevice] = []
     for dev in all_devs:
@@ -131,11 +126,6 @@ async def run(cfg: ServerConfig) -> None:
     # Running pointer position for debug logging; reset on each slot switch.
     mouse_x: int = 0
     mouse_y: int = 0
-    # Touchpad ABS tracking: last reported absolute position (None = finger up).
-    _tp_x: int | None = None
-    _tp_y: int | None = None
-    _tp_dx: int = 0
-    _tp_dy: int = 0
 
     # ── routing helpers ──────────────────────────────────────────────────────
     def _is_mouse(ev) -> bool:
@@ -183,7 +173,7 @@ async def run(cfg: ServerConfig) -> None:
 
     # ── slot switch ──────────────────────────────────────────────────────────
     async def _switch(new_slot: int) -> None:
-        nonlocal current, mouse_x, mouse_y, _tp_x, _tp_y, _tp_dx, _tp_dy
+        nonlocal current, mouse_x, mouse_y
         if new_slot == current:
             return
         # Release held keys on the outgoing target.
@@ -197,10 +187,6 @@ async def run(cfg: ServerConfig) -> None:
         # Reset pointer tracking for the new target.
         mouse_x = 0
         mouse_y = 0
-        _tp_x = None
-        _tp_y = None
-        _tp_dx = 0
-        _tp_dy = 0
         current = new_slot
         if new_slot == 0:
             log.info("→ local  (clients: %s)", list(clients) or "none")
@@ -209,17 +195,34 @@ async def run(cfg: ServerConfig) -> None:
 
     # ── per-device read loop ─────────────────────────────────────────────────
     async def _read_device(dev: InputDevice) -> None:
-        nonlocal mouse_x, mouse_y, _tp_x, _tp_y, _tp_dx, _tp_dy
+        nonlocal mouse_x, mouse_y
+        # A touchpad has EV_ABS but no alphanumeric keys (KEY_A distinguishes
+        # keyboards that also happen to have ABS axes, e.g. some all-in-ones).
+        dev_caps = dev.capabilities()
+        is_touchpad = ecodes.EV_ABS in dev_caps and ecodes.KEY_A not in dev_caps.get(ecodes.EV_KEY, [])
         try:
             async for ev in dev.async_read_loop():
-                if ev.type == ecodes.EV_KEY:
-                    # Drop touchpad-only buttons before any further processing.
-                    if ev.code in _TOUCHPAD_ONLY_BTNS:
-                        if ev.code == ecodes.BTN_TOUCH and ev.value == 0:
-                            _tp_x = None
-                            _tp_y = None
-                        continue
+                # ── local touchpad passthrough ────────────────────────────
+                # In local mode, forward every raw event to the virtual
+                # touchpad so libinput processes gestures (tap-to-click,
+                # two-finger scroll, etc.) exactly as on the physical device.
+                if is_touchpad and current == 0:
+                    if vtouchpad is not None:
+                        vtouchpad.write(ev.type, ev.code, ev.value)
+                    continue
 
+                # ── remote touchpad: forward all raw events ───────────────
+                # The client creates a matching virtual touchpad from the
+                # capabilities sent at connect time; libinput there handles
+                # all gesture processing.
+                if is_touchpad:
+                    _write_remote(ev)
+                    if ev.type == ecodes.EV_SYN:
+                        await _flush_remote()
+                    continue
+
+                # ── keyboard / mouse events ───────────────────────────────
+                if ev.type == ecodes.EV_KEY:
                     if ev.value == 1:  # key down
                         held_keys.add(ev.code)
                     elif ev.value == 0:  # key up
@@ -244,45 +247,6 @@ async def run(cfg: ServerConfig) -> None:
                         mouse_y += ev.value
                     log.debug("[%d] mouse %s %+d  pos(%d,%d)", current, ecodes.REL.get(ev.code, ev.code), ev.value, mouse_x, mouse_y)
 
-                elif ev.type == ecodes.EV_ABS:
-                    # Touchpad: accumulate deltas; emit synthetic EV_REL on EV_SYN.
-                    if ev.code in _TP_X_CODES:
-                        if _tp_x is not None:
-                            _tp_dx += ev.value - _tp_x
-                        _tp_x = ev.value
-                        log.debug("[%d] abs X=%d  dx=%+d", current, ev.value, _tp_dx)
-                    elif ev.code in _TP_Y_CODES:
-                        if _tp_y is not None:
-                            _tp_dy += ev.value - _tp_y
-                        _tp_y = ev.value
-                        log.debug("[%d] abs Y=%d  dy=%+d", current, ev.value, _tp_dy)
-                    elif ev.code == _ABS_MT_TRACKING_ID and ev.value == -1:
-                        # Type-B multitouch: finger lifted — reset position.
-                        _tp_x = None
-                        _tp_y = None
-                    continue  # never forward raw ABS events
-
-                # SYN_MT_REPORT is an internal multitouch sync; skip entirely.
-                if ev.type == ecodes.EV_SYN and ev.code != ecodes.SYN_REPORT:
-                    continue
-
-                # EV_SYN SYN_REPORT: flush accumulated touchpad deltas first.
-                if ev.type == ecodes.EV_SYN:
-                    if _tp_dx or _tp_dy:
-                        mouse_x += _tp_dx
-                        mouse_y += _tp_dy
-                        log.debug("[%d] touchpad rel(%+d,%+d)  pos(%d,%d)", current, _tp_dx, _tp_dy, mouse_x, mouse_y)
-                        rel_x = protocol.RawEvent(ecodes.EV_REL, ecodes.REL_X, _tp_dx)
-                        rel_y = protocol.RawEvent(ecodes.EV_REL, ecodes.REL_Y, _tp_dy)
-                        _tp_dx = 0
-                        _tp_dy = 0
-                        if current == 0:
-                            _route_local(rel_x)
-                            _route_local(rel_y)
-                        else:
-                            _write_remote(rel_x)
-                            _write_remote(rel_y)
-
                 if current == 0:
                     _route_local(ev)
                 else:
@@ -306,6 +270,10 @@ async def run(cfg: ServerConfig) -> None:
         mods_names = "+".join(_key_name(c) for c in sorted(cfg.switch_mods))
         log.info("Client %d connected from %s  →  press %s+%d to switch", slot, addr, mods_names, slot + 1)
         try:
+            # Send touchpad capabilities so the client can create a matching
+            # virtual touchpad.  Must arrive before the event stream.
+            w.write(protocol.pack_caps(touchpad_caps))
+            await w.drain()
             # Block until EOF (client never sends data; disconnect = EOF).
             await r.read()
         except OSError:
@@ -345,6 +313,8 @@ async def run(cfg: ServerConfig) -> None:
                 pass
         vkbd.close()
         vmouse.close()
+        if vtouchpad is not None:
+            vtouchpad.close()
         log.info("Ungrabbed all devices")
 
 

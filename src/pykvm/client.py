@@ -19,6 +19,21 @@ log = logging.getLogger(__name__)
 # BTN_MOUSE … BTN_JOYSTICK-1 are mouse/pointer button codes.
 _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYSTICK))
 
+# Touchpad-specific button codes that must go to the virtual touchpad so
+# libinput can process tap-to-click, gestures, etc.
+_TOUCHPAD_BTNS: frozenset[int] = frozenset(
+    c
+    for name in (
+        "BTN_TOUCH",
+        "BTN_TOOL_FINGER",
+        "BTN_TOOL_DOUBLETAP",
+        "BTN_TOOL_TRIPLETAP",
+        "BTN_TOOL_QUADTAP",
+        "BTN_TOOL_QUINTTAP",
+    )
+    if (c := getattr(ecodes, name, None)) is not None
+)
+
 _VAL = {0: "up", 1: "dn", 2: "rp"}
 
 
@@ -36,12 +51,31 @@ async def run(cfg: ClientConfig) -> None:
     reader, _ = await asyncio.open_connection(cfg.server_host, cfg.server_port)
     log.info("Connected")
 
+    # ── capability handshake ─────────────────────────────────────────────────
+    # Server sends a 4-byte length followed by a JSON caps body (or length 0
+    # when no physical touchpad is attached).
+    vtouchpad = None
+    try:
+        hdr = await reader.readexactly(protocol.CAPS_HDR_SIZE)
+        caps_len = protocol.unpack_caps_header(hdr)
+        if caps_len > 0:
+            body = await reader.readexactly(caps_len)
+            caps_json = protocol.unpack_caps_body(body)
+            vtouchpad = devices.create_virtual_touchpad_from_caps(caps_json)
+            log.info("Virtual touchpad created")
+        else:
+            log.info("Server has no touchpad")
+    except asyncio.IncompleteReadError:
+        log.info("Server closed the connection during handshake")
+        vkbd.close()
+        vmouse.close()
+        return
+
     # Track which virtual device received the last non-SYN event so that
     # EV_SYN / SYN_REPORT is flushed to the correct device.
     last_target = vkbd
 
     # Running mouse position (relative to start) used for debug logging.
-    # Updated on EV_REL; logged once per SYN_REPORT to avoid flooding the log.
     mouse_x: int = 0
     mouse_y: int = 0
 
@@ -50,22 +84,44 @@ async def run(cfg: ClientConfig) -> None:
             data = await reader.readexactly(protocol.EVENT_SIZE)
             event = protocol.unpack(data)
 
-            if event.type == ecodes.EV_REL:
+            if event.type == ecodes.EV_ABS:
+                # Raw touchpad absolute-position event; route to vtouchpad so
+                # libinput on this host can process gestures.
+                if vtouchpad is not None:
+                    last_target = vtouchpad
+                    vtouchpad.write(event.type, event.code, event.value)
+
+            elif event.type == ecodes.EV_REL:
                 last_target = vmouse
                 vmouse.write(event.type, event.code, event.value)
                 if event.code == ecodes.REL_X:
                     mouse_x += event.value
                 elif event.code == ecodes.REL_Y:
                     mouse_y += event.value
+
             elif event.type == ecodes.EV_KEY:
-                if event.code in _MOUSE_BTNS:
-                    last_target = vmouse
-                    vmouse.write(event.type, event.code, event.value)
-                    log.debug("mouse %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
+                if vtouchpad is not None and event.code in _TOUCHPAD_BTNS:
+                    # BTN_TOUCH / BTN_TOOL_FINGER / etc. — always to touchpad.
+                    last_target = vtouchpad
+                    vtouchpad.write(event.type, event.code, event.value)
+                    log.debug("tp    %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
+                elif event.code in _MOUSE_BTNS:
+                    # BTN_LEFT/RIGHT/MIDDLE may come from a physical touchpad
+                    # button or a regular mouse.  Use last_target as a
+                    # heuristic: if the previous event was a touchpad event,
+                    # route to vtouchpad; otherwise to vmouse.
+                    if vtouchpad is not None and last_target is vtouchpad:
+                        vtouchpad.write(event.type, event.code, event.value)
+                        log.debug("tp    %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
+                    else:
+                        last_target = vmouse
+                        vmouse.write(event.type, event.code, event.value)
+                        log.debug("mouse %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
                 else:
                     last_target = vkbd
                     vkbd.write(event.type, event.code, event.value)
                     log.debug("kbd   %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
+
             elif event.type == ecodes.EV_SYN:
                 last_target.write(event.type, event.code, event.value)
                 if last_target is vmouse:
@@ -76,6 +132,8 @@ async def run(cfg: ClientConfig) -> None:
     finally:
         vkbd.close()
         vmouse.close()
+        if vtouchpad is not None:
+            vtouchpad.close()
 
 
 def main() -> None:
