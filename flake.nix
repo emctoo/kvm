@@ -273,6 +273,12 @@
           # More RAM so XFCE is comfortable.
           virtualisation.memorySize = lib.mkForce 2048;
 
+          # Default QEMU window is 800×600; bump to something usable.
+          virtualisation.resolution = {
+            x = 1440;
+            y = 900;
+          };
+
           services.openssh = {
             enable = true;
             settings.PermitRootLogin = "yes";
@@ -322,7 +328,7 @@
 
           environment.systemPackages = with pkgs; [
             evtest
-            xterm
+            ghostty
             microsoft-edge
           ];
 
