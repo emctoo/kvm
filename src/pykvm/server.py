@@ -35,6 +35,7 @@ touchpad capabilities.
 
 import asyncio
 import logging
+import socket
 import sys
 from argparse import ArgumentParser
 
@@ -46,6 +47,28 @@ from pykvm.config import ServerConfig
 log = logging.getLogger(__name__)
 
 _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYSTICK))
+
+
+def _apply_keepalive(sock: socket.socket, *, idle: int = 10, interval: int = 5, count: int = 3) -> None:
+    """Enable TCP keep-alive on *sock* with aggressive timeouts.
+
+    With the defaults a half-open connection is detected in roughly
+    idle + interval * count = 25 seconds, at which point the OS sends a RST
+    and any pending asyncio drain() / read() raises OSError.
+
+    TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT are Linux-specific; the
+    getattr guards make the call safe on platforms that lack them (only
+    SO_KEEPALIVE is set there, which still helps).
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, val in (
+        (getattr(socket, "TCP_KEEPIDLE", None), idle),
+        (getattr(socket, "TCP_KEEPINTVL", None), interval),
+        (getattr(socket, "TCP_KEEPCNT", None), count),
+    ):
+        if opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+
 
 # Digit key → digit value (1-9).  Used to detect slot-switch combos.
 _DIGIT_TO_NUM: dict[int, int] = {getattr(ecodes, f"KEY_{i}"): i for i in range(1, 10) if hasattr(ecodes, f"KEY_{i}")}
@@ -344,14 +367,34 @@ async def run(cfg: ServerConfig) -> None:
         return is_kbd or is_rel or is_tp
 
     async def _hotplug_monitor() -> None:
-        """Poll /dev/input/ every second; grab newly connected input devices."""
+        """Poll /dev/input/ every second; grab newly connected input devices.
+
+        Uses a *known_paths* snapshot to detect genuine plug events.  A path
+        is only attempted when it is **new** (absent from the previous scan).
+        Devices that fail to grab (EBUSY, permission denied, etc.) are left in
+        known_paths so they are not retried every second — they get a fresh
+        chance only if they physically disappear and reappear (i.e. a real
+        unplug/replug cycle removes them from known_paths).
+        """
+        try:
+            known_paths: set[str] = set(list_devices())
+        except OSError:
+            known_paths = set()
+
         while True:
             await asyncio.sleep(1.0)
             try:
                 current_paths = set(list_devices())
             except OSError:
                 continue
-            for path in current_paths - set(grabbed) - own_paths:
+
+            new_paths = current_paths - known_paths - own_paths
+            # Update snapshot *before* awaiting grabs so that virtual devices
+            # created inside _grab_device (e.g. vtouchpad) appear in the next
+            # known_paths and are excluded via own_paths rather than re-tried.
+            known_paths = current_paths
+
+            for path in new_paths:
                 try:
                     dev = InputDevice(path)
                 except OSError:
@@ -372,6 +415,7 @@ async def run(cfg: ServerConfig) -> None:
             slot += 1
         clients[slot] = w
         addr = w.get_extra_info("peername")
+        _apply_keepalive(w.get_extra_info("socket"))
         mods_names = "+".join(_key_name(c) for c in sorted(cfg.switch_mods))
         log.info("Client %d connected from %s  →  press %s+%d to switch", slot, addr, mods_names, slot + 1)
         try:
@@ -453,7 +497,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s")
 
     if args.debug:
         root = logging.getLogger()

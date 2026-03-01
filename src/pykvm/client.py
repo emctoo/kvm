@@ -20,6 +20,7 @@ sessions.
 
 import asyncio
 import logging
+import socket
 from argparse import ArgumentParser
 
 from evdev import ecodes
@@ -31,6 +32,25 @@ log = logging.getLogger(__name__)
 
 # BTN_MOUSE … BTN_JOYSTICK-1 are mouse/pointer button codes.
 _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYSTICK))
+
+
+def _apply_keepalive(sock: socket.socket, *, idle: int = 10, interval: int = 5, count: int = 3) -> None:
+    """Enable TCP keep-alive on *sock* with aggressive timeouts.
+
+    With the defaults a half-open connection is detected in roughly
+    idle + interval * count = 25 seconds, at which point the OS sends a RST
+    and any pending asyncio read() raises OSError / IncompleteReadError,
+    triggering the reconnect loop.
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, val in (
+        (getattr(socket, "TCP_KEEPIDLE", None), idle),
+        (getattr(socket, "TCP_KEEPINTVL", None), interval),
+        (getattr(socket, "TCP_KEEPCNT", None), count),
+    ):
+        if opt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+
 
 # Touchpad-specific button codes that must go to the virtual touchpad so
 # libinput can process tap-to-click, gestures, etc.
@@ -75,6 +95,7 @@ async def run(cfg: ClientConfig) -> None:
                 log.info("Connecting to %s:%d …", cfg.server_host, cfg.server_port)
                 reader, writer = await asyncio.open_connection(cfg.server_host, cfg.server_port)
                 log.info("Connected")
+                _apply_keepalive(writer.get_extra_info("socket"))
                 delay = _BACKOFF_INIT  # successful connection → reset back-off
 
                 # ── capability handshake ──────────────────────────────────
@@ -178,7 +199,7 @@ def main() -> None:
     parser.add_argument("--debug", "-v", action="store_true", help="Log injected events to /tmp/pykvm.debug.log")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s")
 
     if args.debug:
         root = logging.getLogger()
