@@ -19,6 +19,18 @@ back to local mode automatically.
 
 On every slot switch, held keys are synthetically released on the
 outgoing target to prevent stuck keys.
+
+Hot-plug
+--------
+The server monitors /dev/input/ every second.  Newly connected keyboards,
+mice, and touchpads are grabbed automatically without a restart.  When a
+device is unplugged its read task exits gracefully and the device is
+released; a log message is emitted for each event.
+
+If a touchpad is hot-plugged after startup and no touchpad was present at
+launch, the virtual touchpad is created at that point.  Clients that
+connected *before* the touchpad appeared must reconnect to receive
+touchpad capabilities.
 """
 
 import asyncio
@@ -26,7 +38,7 @@ import logging
 import sys
 from argparse import ArgumentParser
 
-from evdev import InputDevice, ecodes
+from evdev import InputDevice, ecodes, list_devices
 
 from pykvm import devices, protocol
 from pykvm.config import ServerConfig
@@ -47,7 +59,7 @@ def _key_name(code: int) -> str:
 
 
 async def run(cfg: ServerConfig) -> None:
-    # ── discover and grab physical devices ──────────────────────────────────
+    # ── discover and log physical devices ────────────────────────────────────
     keyboards = devices.find_keyboards()
     mice = devices.find_mice()
 
@@ -58,13 +70,9 @@ async def run(cfg: ServerConfig) -> None:
             dev.close()
         else:
             seen[dev.path] = dev
-    all_devs: list[InputDevice] = list(seen.values())
+    init_devs: list[InputDevice] = list(seen.values())
 
-    if not all_devs:
-        log.error("No input devices found. Is the user in the 'input' group?")
-        sys.exit(1)
-
-    for dev in all_devs:
+    for dev in init_devs:
         caps = dev.capabilities()
         has_kbd = ecodes.KEY_A in caps.get(ecodes.EV_KEY, [])
         has_rel = ecodes.EV_REL in caps
@@ -78,7 +86,7 @@ async def run(cfg: ServerConfig) -> None:
     # Virtual touchpad for local-mode passthrough.  Created from the first
     # grabbed touchpad device so its ABS ranges and button layout match the
     # physical hardware; libinput then processes gestures normally.
-    _tp_sources = [d for d in all_devs if ecodes.EV_ABS in d.capabilities() and ecodes.KEY_A not in d.capabilities().get(ecodes.EV_KEY, [])]
+    _tp_sources = [d for d in init_devs if ecodes.EV_ABS in d.capabilities() and ecodes.KEY_A not in d.capabilities().get(ecodes.EV_KEY, [])]
     vtouchpad = devices.create_virtual_touchpad(_tp_sources[0]) if _tp_sources else None
     # Serialise touchpad capabilities (ABS ranges + key codes) to JSON for
     # the client so it can create a matching virtual touchpad.
@@ -96,23 +104,14 @@ async def run(cfg: ServerConfig) -> None:
                 _caps_dict[str(_ev_type)] = list(_codes)
         touchpad_caps = _caps_dict
 
-    grabbed: list[InputDevice] = []
-    for dev in all_devs:
-        try:
-            dev.grab()
-            grabbed.append(dev)
-            log.info("Grabbed %s", dev.path)
-        except OSError as exc:
-            log.warning("Could not grab %s: %s — skipping", dev.path, exc)
-            dev.close()
+    # Paths of our own virtual uinput nodes — never try to grab these.
+    own_paths: set[str] = {vkbd.device.path, vmouse.device.path}
+    if vtouchpad is not None:
+        own_paths.add(vtouchpad.device.path)
 
-    if not grabbed:
-        log.error("No devices could be grabbed.")
-        vkbd.close()
-        vmouse.close()
-        sys.exit(1)
-
-    all_devs = grabbed
+    # ── device registry ───────────────────────────────────────────────────────
+    grabbed: dict[str, InputDevice] = {}  # path → device
+    dev_tasks: dict[str, asyncio.Task] = {}  # path → read task
 
     # ── shared mutable state ─────────────────────────────────────────────────
     # current: active slot — 0 = local, N = connected client N.
@@ -196,9 +195,13 @@ async def run(cfg: ServerConfig) -> None:
     # ── per-device read loop ─────────────────────────────────────────────────
     async def _read_device(dev: InputDevice) -> None:
         nonlocal mouse_x, mouse_y
+        try:
+            dev_caps = dev.capabilities()
+        except OSError as exc:
+            log.warning("Device %s: could not read capabilities: %s", dev.path, exc)
+            return
         # A touchpad has EV_ABS but no alphanumeric keys (KEY_A distinguishes
         # keyboards that also happen to have ABS axes, e.g. some all-in-ones).
-        dev_caps = dev.capabilities()
         is_touchpad = ecodes.EV_ABS in dev_caps and ecodes.KEY_A not in dev_caps.get(ecodes.EV_KEY, [])
         try:
             async for ev in dev.async_read_loop():
@@ -256,6 +259,108 @@ async def run(cfg: ServerConfig) -> None:
 
         except asyncio.CancelledError:
             pass
+        except OSError as exc:
+            log.warning("Device %s (%s) removed: %s", dev.path, dev.name, exc)
+
+    # ── device grab / release ─────────────────────────────────────────────────
+    def _on_task_done(path: str, dev: InputDevice, _task: asyncio.Task) -> None:
+        """Synchronous done-callback: remove device from registry and release it."""
+        grabbed.pop(path, None)
+        dev_tasks.pop(path, None)
+        try:
+            dev.ungrab()
+        except OSError:
+            pass
+        try:
+            dev.close()
+        except OSError:
+            pass
+        log.info("Released %s", path)
+
+    async def _grab_device(dev: InputDevice) -> bool:
+        """Grab *dev*, start its read task, register in *grabbed*/*dev_tasks*.
+
+        Returns True on success.  Closes *dev* and returns False on failure.
+        Also creates the virtual touchpad lazily if this is the first touchpad
+        and none was present at startup.
+        """
+        nonlocal vtouchpad, touchpad_caps
+        try:
+            dev.grab()
+        except OSError as exc:
+            log.warning("Could not grab %s (%s): %s — skipping", dev.path, dev.name, exc)
+            dev.close()
+            return False
+
+        # Lazy vtouchpad creation: first touchpad seen (startup or hot-plug).
+        dev_caps = dev.capabilities()
+        is_tp = ecodes.EV_ABS in dev_caps and ecodes.KEY_A not in dev_caps.get(ecodes.EV_KEY, [])
+        if is_tp and vtouchpad is None:
+            vtouchpad = devices.create_virtual_touchpad(dev)
+            own_paths.add(vtouchpad.device.path)
+            _SKIP_EV = {ecodes.EV_SYN, ecodes.EV_MSC}
+            raw_caps = dev.capabilities(absinfo=True)
+            _caps_dict: dict = {}
+            for _ev_type, _codes in raw_caps.items():
+                if _ev_type in _SKIP_EV:
+                    continue
+                if _ev_type == ecodes.EV_ABS:
+                    _caps_dict[str(_ev_type)] = [[c, list(ai)] for c, ai in _codes]
+                else:
+                    _caps_dict[str(_ev_type)] = list(_codes)
+            touchpad_caps = _caps_dict
+            log.info(
+                "Created vtouchpad from %s%s",
+                dev.path,
+                " (hot-plug — reconnect clients to use touchpad)" if dev.path not in {d.path for d in init_devs} else "",
+            )
+
+        grabbed[dev.path] = dev
+        task = asyncio.create_task(_read_device(dev))
+        dev_tasks[dev.path] = task
+        task.add_done_callback(lambda t: _on_task_done(dev.path, dev, t))
+
+        caps = dev.capabilities()
+        keys = caps.get(ecodes.EV_KEY, [])
+        has_kbd = ecodes.KEY_A in keys
+        has_rel = ecodes.EV_REL in caps
+        has_abs = ecodes.EV_ABS in caps and {c for c, _ in caps.get(ecodes.EV_ABS, [])} >= {ecodes.ABS_X, ecodes.ABS_Y}
+        pointer = "touchpad" if has_abs and not has_rel else ("mouse" if has_rel else "")
+        kind = "+".join(filter(None, ["kbd" if has_kbd else "", pointer]))
+        log.info("Grabbed %s  (%s)  [%s]", dev.path, dev.name, kind or "?")
+        return True
+
+    def _want_device(dev: InputDevice) -> bool:
+        """Return True if pykvm should grab this device."""
+        if dev.path in own_paths or dev.name.startswith("pykvm-"):
+            return False
+        caps = dev.capabilities()
+        keys = caps.get(ecodes.EV_KEY, [])
+        abs_codes = {c for c, _ in caps.get(ecodes.EV_ABS, [])}
+        is_kbd = ecodes.KEY_A in keys
+        is_rel = ecodes.EV_REL in caps
+        has_xy = ecodes.ABS_X in abs_codes and ecodes.ABS_Y in abs_codes
+        is_tp = ecodes.EV_ABS in caps and has_xy and ecodes.KEY_A not in keys
+        return is_kbd or is_rel or is_tp
+
+    async def _hotplug_monitor() -> None:
+        """Poll /dev/input/ every second; grab newly connected input devices."""
+        while True:
+            await asyncio.sleep(1.0)
+            try:
+                current_paths = set(list_devices())
+            except OSError:
+                continue
+            for path in current_paths - set(grabbed) - own_paths:
+                try:
+                    dev = InputDevice(path)
+                except OSError:
+                    continue
+                if not _want_device(dev):
+                    dev.close()
+                    continue
+                log.info("Hot-plug: detected %s  (%s)", path, dev.name)
+                await _grab_device(dev)
 
     # ── TCP server ───────────────────────────────────────────────────────────
     async def _handle_client(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
@@ -296,19 +401,37 @@ async def run(cfg: ServerConfig) -> None:
     log.info("Listening on %s  —  slot: local  —  hotkey: %s+[1-9]", addrs, mods_names)
     log.info("  %s+1 = local  |  +2 = client 1  |  +3 = client 2  |  …", mods_names)
 
-    tasks = [asyncio.create_task(_read_device(d)) for d in all_devs]
+    if not init_devs:
+        log.warning("No input devices found at startup — waiting for hot-plug")
+
+    # Start hotplug monitor before grabbing so own_paths is fully populated.
+    hotplug_task = asyncio.create_task(_hotplug_monitor())
+
+    for dev in init_devs:
+        await _grab_device(dev)
+
+    if not grabbed:
+        log.warning("No devices could be grabbed at startup — is the user in the 'input' group?")
+
     try:
         async with server:
-            await asyncio.gather(*tasks)
+            await server.serve_forever()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        for t in tasks:
+        hotplug_task.cancel()
+        remaining_tasks = list(dev_tasks.values())
+        for t in remaining_tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for dev in all_devs:
+        await asyncio.gather(hotplug_task, *remaining_tasks, return_exceptions=True)
+        # Devices not yet cleaned up by their done-callbacks (edge case).
+        for dev in list(grabbed.values()):
             try:
                 dev.ungrab()
+            except OSError:
+                pass
+            try:
+                dev.close()
             except OSError:
                 pass
         vkbd.close()
