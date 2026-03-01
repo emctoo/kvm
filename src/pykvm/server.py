@@ -259,18 +259,28 @@ async def run(cfg: ServerConfig) -> None:
         nonlocal current, mouse_x, mouse_y
         if new_slot == current:
             return
-        # Release held keys on the outgoing target.
-        if current == 0:
-            _release_held_local()
-        else:
-            w = clients.get(current)
-            if w is not None:
-                await _release_held_on(w)
-        held_keys.clear()
-        # Reset pointer tracking for the new target.
+        old_slot = current
+        # Redirect routing immediately so that any events arriving while we
+        # await _release_held_on (which yields on w.drain()) are already sent
+        # to new_slot instead of old_slot, preventing ghost inputs.
+        current = new_slot
         mouse_x = 0
         mouse_y = 0
-        current = new_slot
+        # Release held keys on the *outgoing* target.
+        if old_slot == 0:
+            _release_held_local()
+        else:
+            w = clients.get(old_slot)
+            if w is not None:
+                await _release_held_on(w)
+        # Do NOT clear held_keys here.  held_keys must mirror the real physical
+        # keyboard state at all times so that:
+        #   - hotkey detection works correctly on the next slot,
+        #   - modifier key-up events released after the switch are forwarded to
+        #     the new slot (expected behaviour, not a bug),
+        #   - rapid consecutive switches while keeping mods held work reliably.
+        # Ghost UP events on the new slot (mods/digit released after switching)
+        # are harmless: remote systems ignore UP-without-DOWN.
         if new_slot == 0:
             log.info("→ local  (clients: %s)", list(clients) or "none")
         else:
@@ -376,16 +386,29 @@ async def run(cfg: ServerConfig) -> None:
             dev.close()
             return False
 
+        # Read all capabilities before mutating any shared state.  If the
+        # device disconnects between grab() and here (contact bounce, etc.)
+        # capabilities() raises OSError — ungrab and bail out cleanly.
+        try:
+            dev_caps = dev.capabilities()
+            is_tp = ecodes.EV_ABS in dev_caps and ecodes.KEY_A not in dev_caps.get(ecodes.EV_KEY, [])
+            raw_caps_absinfo = dev.capabilities(absinfo=True) if (is_tp and vtouchpad is None) else None
+        except OSError as exc:
+            log.warning("Device %s (%s) vanished after grab: %s — releasing", dev.path, dev.name, exc)
+            try:
+                dev.ungrab()
+            except OSError:
+                pass
+            dev.close()
+            return False
+
         # Lazy vtouchpad creation: first touchpad seen (startup or hot-plug).
-        dev_caps = dev.capabilities()
-        is_tp = ecodes.EV_ABS in dev_caps and ecodes.KEY_A not in dev_caps.get(ecodes.EV_KEY, [])
-        if is_tp and vtouchpad is None:
+        if is_tp and vtouchpad is None and raw_caps_absinfo is not None:
             vtouchpad = devices.create_virtual_touchpad(dev)
             own_paths.add(vtouchpad.device.path)
             _SKIP_EV = {ecodes.EV_SYN, ecodes.EV_MSC}
-            raw_caps = dev.capabilities(absinfo=True)
             _caps_dict: dict = {}
-            for _ev_type, _codes in raw_caps.items():
+            for _ev_type, _codes in raw_caps_absinfo.items():
                 if _ev_type in _SKIP_EV:
                     continue
                 if _ev_type == ecodes.EV_ABS:
@@ -404,14 +427,19 @@ async def run(cfg: ServerConfig) -> None:
         dev_tasks[dev.path] = task
         task.add_done_callback(lambda t: _on_task_done(dev.path, dev, t))
 
-        caps = dev.capabilities()
-        keys = caps.get(ecodes.EV_KEY, [])
-        has_kbd = ecodes.KEY_A in keys
-        has_rel = ecodes.EV_REL in caps
-        has_abs = ecodes.EV_ABS in caps and {c for c, _ in caps.get(ecodes.EV_ABS, [])} >= {ecodes.ABS_X, ecodes.ABS_Y}
-        pointer = "touchpad" if has_abs and not has_rel else ("mouse" if has_rel else "")
-        kind = "+".join(filter(None, ["kbd" if has_kbd else "", pointer]))
-        log.info("Grabbed %s  (%s)  [%s]", dev.path, dev.name, kind or "?")
+        # Capabilities for the log line — device may have gone away by now;
+        # degrade gracefully to "?" rather than crashing the caller.
+        try:
+            caps = dev.capabilities()
+            keys = caps.get(ecodes.EV_KEY, [])
+            has_kbd = ecodes.KEY_A in keys
+            has_rel = ecodes.EV_REL in caps
+            has_abs = ecodes.EV_ABS in caps and {c for c, _ in caps.get(ecodes.EV_ABS, [])} >= {ecodes.ABS_X, ecodes.ABS_Y}
+            pointer = "touchpad" if has_abs and not has_rel else ("mouse" if has_rel else "")
+            kind = "+".join(filter(None, ["kbd" if has_kbd else "", pointer])) or "?"
+        except OSError:
+            kind = "?"
+        log.info("Grabbed %s  (%s)  [%s]", dev.path, dev.name, kind)
         return True
 
     def _want_device(dev: InputDevice) -> bool:
@@ -420,7 +448,10 @@ async def run(cfg: ServerConfig) -> None:
             return False
         if _is_ignored(dev, cfg.ignore_devices):
             return False
-        caps = dev.capabilities()
+        try:
+            caps = dev.capabilities()
+        except OSError:
+            return False  # device vanished between open() and capabilities(); caller closes it
         keys = caps.get(ecodes.EV_KEY, [])
         abs_codes = {c for c, _ in caps.get(ecodes.EV_ABS, [])}
         is_kbd = ecodes.KEY_A in keys
