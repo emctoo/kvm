@@ -74,14 +74,39 @@ def create_virtual_touchpad_from_caps(caps_json: dict) -> UInput:
 
     AbsInfo ranges are reconstructed so libinput classifies the device
     identically to the physical touchpad on the server.
+
+    Raises ValueError if any field cannot be coerced to the expected type,
+    so callers can handle corrupt or tampered data without crashing.
     """
     caps: dict = {}
-    for key, codes in caps_json.items():
-        ev_type = int(key)
-        if ev_type == ecodes.EV_ABS:
-            caps[ev_type] = [(code, AbsInfo(*absinfo)) for code, absinfo in codes]
-        else:
-            caps[ev_type] = codes
+    try:
+        for key, codes in caps_json.items():
+            try:
+                ev_type = int(key)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"caps: invalid ev_type key {key!r}") from exc
+
+            if not isinstance(codes, list):
+                raise ValueError(f"caps: codes for ev_type {ev_type} must be a list, got {type(codes).__name__}")
+
+            if ev_type == ecodes.EV_ABS:
+                abs_caps = []
+                for entry in codes:
+                    try:
+                        code, absinfo = entry
+                        abs_caps.append((int(code), AbsInfo(*[int(x) for x in absinfo])))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"caps: malformed EV_ABS entry {entry!r}") from exc
+                caps[ev_type] = abs_caps
+            else:
+                try:
+                    caps[ev_type] = [int(c) for c in codes]
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"caps: invalid code in ev_type {ev_type}: {exc}") from exc
+    except AttributeError as exc:
+        # caps_json.items() failed — top-level object is not a dict
+        raise ValueError(f"caps: expected dict, got {type(caps_json).__name__}") from exc
+
     return UInput(
         caps,
         name="pykvm-touchpad",

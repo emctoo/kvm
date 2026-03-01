@@ -115,6 +115,26 @@ def _parse_mods(value: str) -> frozenset[int]:
     return frozenset(codes)
 
 
+def _is_ignored(dev: InputDevice, patterns: frozenset[str]) -> bool:
+    """Return True if *dev* should be excluded according to *patterns*.
+
+    Matching rules (checked in order for each pattern):
+    - Pattern starts with ``/`` → exact match against ``dev.path``.
+    - Otherwise → case-insensitive substring match against ``dev.name``.
+    """
+    if not patterns:
+        return False
+    name_lower = dev.name.lower()
+    for pat in patterns:
+        if pat.startswith("/"):
+            if dev.path == pat:
+                return True
+        else:
+            if pat.lower() in name_lower:
+                return True
+    return False
+
+
 async def run(cfg: ServerConfig) -> None:
     # ── discover and log physical devices ────────────────────────────────────
     keyboards = devices.find_keyboards()
@@ -129,7 +149,12 @@ async def run(cfg: ServerConfig) -> None:
             seen[dev.path] = dev
     init_devs: list[InputDevice] = list(seen.values())
 
+    filtered: list[InputDevice] = []
     for dev in init_devs:
+        if _is_ignored(dev, cfg.ignore_devices):
+            log.info("Ignored %s  (%s)  — matches --ignore-device", dev.path, dev.name)
+            dev.close()
+            continue
         caps = dev.capabilities()
         has_kbd = ecodes.KEY_A in caps.get(ecodes.EV_KEY, [])
         has_rel = ecodes.EV_REL in caps
@@ -137,6 +162,8 @@ async def run(cfg: ServerConfig) -> None:
         pointer = "touchpad" if has_abs and not has_rel else ("mouse" if has_rel else "")
         kind = "+".join(filter(None, ["kbd" if has_kbd else "", pointer]))
         log.info("Found  %s  (%s)  [%s]", dev.name, dev.path, kind or "?")
+        filtered.append(dev)
+    init_devs = filtered
 
     vkbd = devices.create_virtual_keyboard()
     vmouse = devices.create_virtual_mouse()
@@ -391,6 +418,8 @@ async def run(cfg: ServerConfig) -> None:
         """Return True if pykvm should grab this device."""
         if dev.path in own_paths or dev.name.startswith("pykvm-"):
             return False
+        if _is_ignored(dev, cfg.ignore_devices):
+            return False
         caps = dev.capabilities()
         keys = caps.get(ecodes.EV_KEY, [])
         abs_codes = {c for c, _ in caps.get(ecodes.EV_ABS, [])}
@@ -537,6 +566,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--ignore-device",
+        metavar="PATTERN",
+        action="append",
+        default=[],
+        dest="ignore_devices",
+        help=(
+            "Exclude devices whose name contains PATTERN (case-insensitive substring). "
+            "Prefix with '/' to match an exact /dev/input/eventN path instead. "
+            "May be repeated. Applied at startup and during hot-plug monitoring. "
+            "Example: --ignore-device 'Power Button' --ignore-device 'Video Bus'"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         "-v",
         action="store_true",
@@ -558,7 +600,7 @@ def main() -> None:
         root.addHandler(fh)
         log.info("Debug key log → /tmp/pykvm.debug.log")
 
-    conf = ServerConfig(host=args.host, port=args.port, switch_mods=args.switch_mods)
+    conf = ServerConfig(host=args.host, port=args.port, switch_mods=args.switch_mods, ignore_devices=frozenset(args.ignore_devices))
     try:
         asyncio.run(run(conf))
     except KeyboardInterrupt:

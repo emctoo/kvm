@@ -71,6 +71,7 @@ _VAL = {0: "up", 1: "dn", 2: "rp"}
 
 _BACKOFF_INIT = 1.0  # seconds before first retry
 _BACKOFF_MAX = 60.0  # ceiling for exponential back-off
+_HANDSHAKE_TIMEOUT = 5.0  # seconds to wait for the server capability header
 
 
 def _key_name(code: int) -> str:
@@ -101,10 +102,18 @@ async def run(cfg: ClientConfig) -> None:
                 # ── capability handshake ──────────────────────────────────
                 # Server sends a 4-byte length followed by a JSON caps body
                 # (or length 0 when no physical touchpad is attached).
-                hdr = await reader.readexactly(protocol.CAPS_HDR_SIZE)
+                # Both reads are guarded by a timeout so a stalled server
+                # cannot block the client indefinitely.
+                hdr = await asyncio.wait_for(
+                    reader.readexactly(protocol.CAPS_HDR_SIZE),
+                    timeout=_HANDSHAKE_TIMEOUT,
+                )
                 caps_len = protocol.unpack_caps_header(hdr)
                 if caps_len > 0:
-                    body = await reader.readexactly(caps_len)
+                    body = await asyncio.wait_for(
+                        reader.readexactly(caps_len),
+                        timeout=_HANDSHAKE_TIMEOUT,
+                    )
                     caps_json = protocol.unpack_caps_body(body)
                     vtouchpad = devices.create_virtual_touchpad_from_caps(caps_json)
                     log.info("Virtual touchpad created")
@@ -167,8 +176,12 @@ async def run(cfg: ClientConfig) -> None:
                         if last_target is vmouse:
                             log.debug("mouse pos (%d, %d)", mouse_x, mouse_y)
 
+            except asyncio.TimeoutError:
+                log.warning("Handshake timed out (server stalled?) — retrying in %.0fs", delay)
             except asyncio.IncompleteReadError:
                 log.info("Server disconnected — reconnecting in %.0fs", delay)
+            except ValueError as exc:
+                log.warning("Malformed capability data (%s) — retrying in %.0fs", exc, delay)
             except OSError as exc:
                 log.warning("Connection failed (%s) — retrying in %.0fs", exc, delay)
             finally:

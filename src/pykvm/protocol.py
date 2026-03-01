@@ -45,8 +45,18 @@ def unpack_caps_header(data: bytes) -> int:
 
 
 def unpack_caps_body(data: bytes) -> dict:
-    """Deserialise the JSON caps body."""
-    return json.loads(data.decode())
+    """Deserialise and minimally validate the JSON caps body.
+
+    Raises ValueError if the bytes are not valid UTF-8, not valid JSON,
+    or the top-level value is not a JSON object (dict).
+    """
+    try:
+        obj = json.loads(data.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"caps: malformed payload: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"caps: expected JSON object, got {type(obj).__name__}")
+    return obj
 
 
 # ── event stream ─────────────────────────────────────────────────────────────

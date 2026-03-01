@@ -17,6 +17,9 @@ class ServerConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     switch_mods: frozenset[int] = field(default_factory=lambda: DEFAULT_SWITCH_MODS)
+    # Patterns matched against device names (case-insensitive substring) or
+    # exact /dev/input/eventN paths (when the pattern starts with '/').
+    ignore_devices: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
