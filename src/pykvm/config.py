@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 DEFAULT_PORT = 5900
 DEFAULT_HOST = "0.0.0.0"
 # Modifier keys held while pressing a digit to switch slots.
-# Default: Left-Ctrl (29) + Left-Win/Meta (125)
+# Default: KEY_LEFTCTRL (29) + KEY_LEFTMETA (125)
 DEFAULT_SWITCH_MODS: frozenset[int] = frozenset({29, 125})
 
 

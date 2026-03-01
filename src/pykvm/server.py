@@ -37,12 +37,12 @@ import asyncio
 import logging
 import socket
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 
 from evdev import InputDevice, ecodes, list_devices
 
 from pykvm import devices, protocol
-from pykvm.config import ServerConfig
+from pykvm.config import DEFAULT_SWITCH_MODS, ServerConfig
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +79,40 @@ _VAL = {0: "up", 1: "dn", 2: "rp"}
 def _key_name(code: int) -> str:
     name = ecodes.keys.get(code, str(code))
     return name[0] if isinstance(name, list) else name
+
+
+def _parse_mods(value: str) -> frozenset[int]:
+    """Argparse *type* for ``--switch-mods KEY[,KEY…]``.
+
+    Each token is accepted in any of these forms (case-insensitive):
+      - Full evdev name:  KEY_LEFTCTRL
+      - Without prefix:  LEFTCTRL  or  leftctrl
+      - Raw evdev code:  29
+
+    Raises ArgumentTypeError with a descriptive message on bad input.
+    """
+    codes: set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.lstrip("-").isdigit():
+            codes.add(int(token))
+            continue
+        name = token.upper()
+        if not name.startswith("KEY_"):
+            name = "KEY_" + name
+        code = getattr(ecodes, name, None)
+        if code is None:
+            raise ArgumentTypeError(
+                f"{token!r} is not a recognised key name or evdev code "
+                f"(tried {name!r}). Use KEY_* names such as KEY_LEFTCTRL, "
+                f"KEY_LEFTMETA, KEY_LEFTALT, or raw numeric codes."
+            )
+        codes.add(code)
+    if not codes:
+        raise ArgumentTypeError("--switch-mods requires at least one key.")
+    return frozenset(codes)
 
 
 async def run(cfg: ServerConfig) -> None:
@@ -486,9 +520,22 @@ async def run(cfg: ServerConfig) -> None:
 
 
 def main() -> None:
+    _default_mods_str = ",".join(sorted(_key_name(c) for c in DEFAULT_SWITCH_MODS))
     parser = ArgumentParser(description="pykvm server — capture input devices and forward events over TCP")
     parser.add_argument("--host", default="0.0.0.0", metavar="HOST")
     parser.add_argument("--port", type=int, default=5900)
+    parser.add_argument(
+        "--switch-mods",
+        metavar="KEY[,KEY…]",
+        type=_parse_mods,
+        default=DEFAULT_SWITCH_MODS,
+        help=(
+            "Comma-separated modifier keys that must be held while pressing a digit "
+            "to switch slots. Accepts KEY_* names (e.g. KEY_LEFTCTRL), the same names "
+            "without the KEY_ prefix, or raw evdev codes. "
+            f"(default: {_default_mods_str})"
+        ),
+    )
     parser.add_argument(
         "--debug",
         "-v",
@@ -511,7 +558,7 @@ def main() -> None:
         root.addHandler(fh)
         log.info("Debug key log → /tmp/pykvm.debug.log")
 
-    conf = ServerConfig(host=args.host, port=args.port)
+    conf = ServerConfig(host=args.host, port=args.port, switch_mods=args.switch_mods)
     try:
         asyncio.run(run(conf))
     except KeyboardInterrupt:

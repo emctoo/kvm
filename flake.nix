@@ -250,6 +250,7 @@
       vmDevDesktopModule =
         { pkgs, lib, ... }:
         {
+          nixpkgs.config.allowUnfree = true;
           nix.settings = {
             experimental-features = [
               "nix-command"
@@ -322,7 +323,7 @@
           environment.systemPackages = with pkgs; [
             evtest
             xterm
-            chromium
+            microsoft-edge
           ];
 
           networking.proxy = {
