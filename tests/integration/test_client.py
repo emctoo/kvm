@@ -128,9 +128,7 @@ async def test_syn_follows_keyboard_event():
     await _run_client(reader, vkbd, vmouse)
 
     vkbd.write.assert_any_call(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
-    syn_to_mouse = [
-        c for c in vmouse.write.call_args_list if c.args[0] == ecodes.EV_SYN
-    ]
+    syn_to_mouse = [c for c in vmouse.write.call_args_list if c.args[0] == ecodes.EV_SYN]
     assert not syn_to_mouse
 
 

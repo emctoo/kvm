@@ -499,6 +499,8 @@
               pkgs.uv
               pkgs.just
               pkgs.linuxHeaders # needed to build evdev from source if no wheel
+              pkgs.zig
+              pkgs.zls
             ]
             ++ preCommit.enabledPackages; # tools required by the pre-commit hooks
 
