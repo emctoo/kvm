@@ -179,7 +179,7 @@ while (true) {
 | 核心 evdev 功能覆盖率 | ~75%，缺失部分可用标准库补充 |
 | UInput 虚拟设备能力 | ✅ 完整，`Builder.copyCapabilities()` 尤为强大 |
 | 触摸板检测与支持 | ✅ `isMultiTouch` / `isSingleTouch` 比 Python 版更完整 |
-| 异步 I/O | ⚠️ 需额外工作（epoll 或 libxev） |
+| 异步 I/O | ✅ 采用 libxev（Phase 0 已选定） |
 | 设备枚举 | ⚠️ 需约 20 行标准库代码补充 |
 | Hot-plug 监控 | ⚠️ 需完全自行实现（inotify 或轮询） |
 | TCP 协议层 | ✅ 用 `std.net` 可完全实现，且更高效 |
@@ -187,13 +187,162 @@ while (true) {
 
 ---
 
+## Phase 0 — 调研结果
+
+### 异步 I/O 方案：选定 libxev
+
+**结论：采用 [`mitchellh/libxev`](https://github.com/mitchellh/libxev)。**
+
+理由：
+
+- libxev 在 Linux 上同时支持 `io_uring`（内核 ≥ 5.1）和 `epoll` 后端，会在运行时自动选优；
+  而手写 `epoll` 封装只有 `epoll` 一条路，无 `io_uring` 加速。
+- libxev 已被 [Ghostty](https://ghostty.org)、[zml](https://github.com/zml/zml) 等大型项目在
+  生产中使用，稳定性有保证。
+- libxev 使用 **Proactor 模式**（提交 I/O 请求，等待完成回调），与 Python `asyncio` 的
+  Reactor 模式等价，迁移心智模型成本低。
+- kvm 需要同时多路复用 evdev fd（若干个）+ TCP 连接，libxev 的统一事件循环天然支持，
+  无需在 epoll 之上另行封装 TCP。
+
+**libxev 用于 evdev fd 读取的模式：**
+
+```zig
+const xev = @import("xev");
+
+var loop = try xev.Loop.init(.{});
+defer loop.deinit();
+
+// O_RDONLY | O_NONBLOCK — 用 std.fs 打开，再取裸 fd
+const file_obj = try std.fs.openFileAbsolute("/dev/input/event0", .{ .mode = .read_only });
+defer file_obj.close();
+var file = try xev.File.init(file_obj.handle);
+
+var buf: [24]u8 = undefined; // struct input_event = 24 bytes on 64-bit
+var c: xev.Completion = undefined;
+file.read(&loop, &c, .{ .slice = &buf }, void, null, struct {
+    fn callback(
+        _: ?*void,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        _: xev.File,
+        _: xev.ReadBuffer,
+        res: xev.File.ReadError!usize,
+    ) xev.CallbackAction {
+        const n = res catch |err| { std.log.err("evdev read: {}", .{err}); return .disarm; };
+        if (n != 24) return .rearm; // 忽略不完整读取，继续等待
+        // 解析 buf 为 input_event 并转发
+        return .rearm; // 持续读取
+    }
+}.callback);
+
+try loop.run(.no_wait); // 在主循环中非阻塞跑一轮
+```
+
+**与原生 epoll 对比：**
+
+| 维度 | 原生 epoll | libxev |
+|---|---|---|
+| 代码量 | ~50 行样板 | ~20 行，无样板 |
+| io_uring 支持 | ❌ | ✅（Linux 自动选优） |
+| TCP 统一多路复用 | 需自行整合 | ✅ 内建 |
+| 跨平台 | ❌ Linux only | ✅ macOS/Windows/WASI |
+| 生产验证 | N/A | Ghostty、zml |
+
+### zig-evdev Zig 版本兼容性
+
+**结论：`futsuuu/zig-evdev` 与 Zig **0.15.2** 完全兼容。**
+
+验证方式：直接读取仓库的 `build.zig.zon`：
+
+```zig
+// https://github.com/futsuuu/zig-evdev/blob/main/build.zig.zon
+.minimum_zig_version = "0.15.1",
+```
+
+`0.15.2` ≥ `0.15.1`，满足要求。同理，`libxev` 的 `build.zig.zon` 也标注：
+
+```zig
+// https://github.com/mitchellh/libxev/blob/main/build.zig.zon
+.minimum_zig_version = "0.15.1",
+```
+
+**本项目统一使用 Zig 0.15.2。**
+
+### build.zig.zon 依赖管理方式
+
+两个依赖均使用 Zig 内建包管理器（`zig fetch`）添加，步骤如下：
+
+```sh
+# 1. 添加 zig-evdev
+zig fetch --save https://github.com/futsuuu/zig-evdev/archive/main.tar.gz
+
+# 2. 添加 libxev
+zig fetch --save https://github.com/mitchellh/libxev/archive/main.tar.gz
+```
+
+执行后 `build.zig.zon` 会自动填入 `.url` 和 `.hash`，结构示例：
+
+```zig
+.{
+    .name = "kvm",
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+
+    .dependencies = .{
+        .evdev = .{
+            .url = "https://github.com/futsuuu/zig-evdev/archive/<commit>.tar.gz",
+            .hash = "<zig fetch 生成的哈希>",
+        },
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/<commit>.tar.gz",
+            .hash = "<zig fetch 生成的哈希>",
+        },
+    },
+
+    .paths = .{""},
+}
+```
+
+在 `build.zig` 中引入：
+
+```zig
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const evdev_dep = b.dependency("evdev", .{ .target = target, .optimize = optimize });
+    const xev_dep   = b.dependency("libxev", .{ .target = target, .optimize = optimize });
+
+    const exe = b.addExecutable(.{
+        .name = "kvm",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("evdev", evdev_dep.module("evdev"));
+    exe.root_module.addImport("xev",   xev_dep.module("xev"));
+    b.installArtifact(exe);
+}
+```
+
+### Phase 0 小结
+
+| 待确认项 | 结论 |
+|---|---|
+| 异步 I/O 方案 | ✅ 采用 **libxev**（proactor，io_uring/epoll 双后端） |
+| zig-evdev Zig 版本 | ✅ minimum = 0.15.1，与项目采用的 **0.15.2** 兼容 |
+| libxev Zig 版本 | ✅ minimum = 0.15.1，与项目采用的 **0.15.2** 兼容 |
+| build.zig.zon 依赖管理 | ✅ `zig fetch --save` + `b.dependency()` / `addImport()` |
+
+---
+
 ## TODO List
 
 ### Phase 0 — 调研与准备
 
-- [ ] 确定异步 I/O 方案：原生 `epoll` 封装 vs `libxev` vs 其他
-- [ ] 评估 `futsuuu/zig-evdev` 的 Zig 版本兼容性（当前需要 Zig 0.14+）
-- [ ] 确认 `build.zig.zon` 依赖管理方式（添加 `zig-evdev` 为依赖）
+- [x] 确定异步 I/O 方案：选定 **libxev**（原生 `epoll` 封装放弃，详见上文）
+- [x] 评估 `futsuuu/zig-evdev` 的 Zig 版本兼容性：minimum = 0.15.1，项目用 **0.15.2** ✅
+- [x] 确认 `build.zig.zon` 依赖管理方式：`zig fetch --save` + `b.dependency()` / `addImport()` ✅
 
 ### Phase 1 — 设备层（evdev 封装）
 
@@ -212,7 +361,7 @@ while (true) {
 
 ### Phase 3 — 事件循环与多路复用
 
-- [ ] 实现基于 `epoll` 的多设备事件读取循环（替代 `async_read_loop()`）
+- [ ] 实现基于 **libxev** 的多设备事件读取循环（替代 `async_read_loop()`）
 - [ ] 实现 held_keys 追踪（`EV_KEY` down/up 状态维护）
 - [ ] 实现 slot-switch 热键检测（`switch_mods + digit`）
 - [ ] 实现 stuck key 释放（slot 切换时向 outgoing target 合成 key-up 序列）
@@ -243,7 +392,7 @@ while (true) {
 ## References
 
 - [`futsuuu/zig-evdev`](https://github.com/futsuuu/zig-evdev) — Zig evdev/uinput 绑定
-- [`mitchellh/libxev`](https://github.com/mitchellh/libxev) — Zig 跨平台事件循环（可选）
+- [`mitchellh/libxev`](https://github.com/mitchellh/libxev) — Zig 跨平台事件循环（**已选定，Phase 0**）
 - [Linux `input.h` evdev 文档](https://www.kernel.org/doc/html/latest/input/event-codes.html)
 - [Linux `uinput` 文档](https://www.kernel.org/doc/html/latest/input/uinput.html)
 - [Linux `inotify` 文档](https://man7.org/linux/man-pages/man7/inotify.7.html)
