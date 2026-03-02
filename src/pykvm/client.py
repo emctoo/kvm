@@ -6,16 +6,11 @@ Usage:
 
 Auto-reconnect
 --------------
-The client retries the connection indefinitely with exponential back-off
-(1 s → 2 s → 4 s → … → 60 s cap) whenever the server is unreachable or
-drops the connection.  The back-off resets to 1 s after each successful
-TCP handshake so that normal server restarts reconnect quickly.
+The client retries the connection indefinitely with exponential back-off (1 s → 2 s → 4 s → … → 60 s cap) whenever the server is unreachable or drops the connection.
+The back-off resets to 1 s after each successful TCP handshake so that normal server restarts reconnect quickly.
 
-Virtual keyboard and mouse are created once and kept alive across
-reconnects so that the compositor never sees them disappear.  The virtual
-touchpad is recreated per connection because its ABS capability ranges
-come from the server's capability handshake and may differ between
-sessions.
+Virtual keyboard and mouse are created once and kept alive across reconnects so that the compositor never sees them disappear.
+The virtual touchpad is recreated per connection because its ABS capability ranges come from the server's capability handshake and may differ between sessions.
 """
 
 import asyncio
@@ -37,10 +32,8 @@ _MOUSE_BTNS: frozenset[int] = frozenset(range(ecodes.BTN_MOUSE, ecodes.BTN_JOYST
 def _apply_keepalive(sock: socket.socket, *, idle: int = 10, interval: int = 5, count: int = 3) -> None:
     """Enable TCP keep-alive on *sock* with aggressive timeouts.
 
-    With the defaults a half-open connection is detected in roughly
-    idle + interval * count = 25 seconds, at which point the OS sends a RST
-    and any pending asyncio read() raises OSError / IncompleteReadError,
-    triggering the reconnect loop.
+    With the defaults a half-open connection is detected in roughly idle + interval * count = 25 seconds, at which point the OS sends a RST
+    and any pending asyncio read() raises OSError / IncompleteReadError, triggering the reconnect loop.
     """
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     for opt, val in (
@@ -52,18 +45,10 @@ def _apply_keepalive(sock: socket.socket, *, idle: int = 10, interval: int = 5, 
             sock.setsockopt(socket.IPPROTO_TCP, opt, val)
 
 
-# Touchpad-specific button codes that must go to the virtual touchpad so
-# libinput can process tap-to-click, gestures, etc.
+# Touchpad-specific button codes that must go to the virtual touchpad so libinput can process tap-to-click, gestures, etc.
 _TOUCHPAD_BTNS: frozenset[int] = frozenset(
     c
-    for name in (
-        "BTN_TOUCH",
-        "BTN_TOOL_FINGER",
-        "BTN_TOOL_DOUBLETAP",
-        "BTN_TOOL_TRIPLETAP",
-        "BTN_TOOL_QUADTAP",
-        "BTN_TOOL_QUINTTAP",
-    )
+    for name in ("BTN_TOUCH", "BTN_TOOL_FINGER", "BTN_TOOL_DOUBLETAP", "BTN_TOOL_TRIPLETAP", "BTN_TOOL_QUADTAP", "BTN_TOOL_QUINTTAP")
     if (c := getattr(ecodes, name, None)) is not None
 )
 
@@ -99,21 +84,21 @@ async def run(cfg: ClientConfig) -> None:
                 _apply_keepalive(writer.get_extra_info("socket"))
                 delay = _BACKOFF_INIT  # successful connection → reset back-off
 
+                # ── PSK authentication ────────────────────────────────────
+                writer.write(protocol.make_auth_token(cfg.psk))
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.readexactly(1), timeout=_HANDSHAKE_TIMEOUT)
+                if not protocol.unpack_auth_response(resp):
+                    log.error("Server rejected connection — wrong PSK?")
+                    raise ConnectionRefusedError("authentication rejected")
+
                 # ── capability handshake ──────────────────────────────────
-                # Server sends a 4-byte length followed by a JSON caps body
-                # (or length 0 when no physical touchpad is attached).
-                # Both reads are guarded by a timeout so a stalled server
-                # cannot block the client indefinitely.
-                hdr = await asyncio.wait_for(
-                    reader.readexactly(protocol.CAPS_HDR_SIZE),
-                    timeout=_HANDSHAKE_TIMEOUT,
-                )
+                # Server sends a 4-byte length followed by a JSON caps body (or length 0 when no physical touchpad is attached).
+                # Both reads are guarded by a timeout so a stalled server cannot block the client indefinitely.
+                hdr = await asyncio.wait_for(reader.readexactly(protocol.CAPS_HDR_SIZE), timeout=_HANDSHAKE_TIMEOUT)
                 caps_len = protocol.unpack_caps_header(hdr)
                 if caps_len > 0:
-                    body = await asyncio.wait_for(
-                        reader.readexactly(caps_len),
-                        timeout=_HANDSHAKE_TIMEOUT,
-                    )
+                    body = await asyncio.wait_for(reader.readexactly(caps_len), timeout=_HANDSHAKE_TIMEOUT)
                     caps_json = protocol.unpack_caps_body(body)
                     vtouchpad = devices.create_virtual_touchpad_from_caps(caps_json)
                     log.info("Virtual touchpad created")
@@ -121,8 +106,7 @@ async def run(cfg: ClientConfig) -> None:
                     log.info("Server has no touchpad")
 
                 # ── event loop ────────────────────────────────────────────
-                # Track which virtual device received the last non-SYN event
-                # so that EV_SYN / SYN_REPORT is flushed to the correct device.
+                # Track which virtual device received the last non-SYN event so that EV_SYN / SYN_REPORT is flushed to the correct device.
                 last_target = vkbd
 
                 # Running mouse position (relative to start) for debug logging.
@@ -134,8 +118,7 @@ async def run(cfg: ClientConfig) -> None:
                     event = protocol.unpack(data)
 
                     if event.type == ecodes.EV_ABS:
-                        # Raw touchpad absolute-position event; route to vtouchpad
-                        # so libinput on this host can process gestures.
+                        # Raw touchpad absolute-position event; route to vtouchpad so libinput on this host can process gestures.
                         if vtouchpad is not None:
                             last_target = vtouchpad
                             vtouchpad.write(event.type, event.code, event.value)
@@ -155,10 +138,8 @@ async def run(cfg: ClientConfig) -> None:
                             vtouchpad.write(event.type, event.code, event.value)
                             log.debug("tp    %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
                         elif event.code in _MOUSE_BTNS:
-                            # BTN_LEFT/RIGHT/MIDDLE may come from a physical touchpad
-                            # button or a regular mouse.  Use last_target as a
-                            # heuristic: if the previous event was a touchpad event,
-                            # route to vtouchpad; otherwise to vmouse.
+                            # BTN_LEFT/RIGHT/MIDDLE may come from a physical touchpad button or a regular mouse.
+                            # Use last_target as a heuristic: if the previous event was a touchpad event, route to vtouchpad; otherwise to vmouse.
                             if vtouchpad is not None and last_target is vtouchpad:
                                 vtouchpad.write(event.type, event.code, event.value)
                                 log.debug("tp    %s %s", _key_name(event.code), _VAL.get(event.value, event.value))
@@ -209,6 +190,7 @@ def main() -> None:
     parser = ArgumentParser(description="pykvm client — inject events received from a pykvm server")
     parser.add_argument("--server", required=True, metavar="HOST")
     parser.add_argument("--port", type=int, default=5900)
+    parser.add_argument("--psk", metavar="SECRET", default=None, help="Pre-shared key (must match the server's --psk).")
     parser.add_argument("--debug", "-v", action="store_true", help="Log injected events to /tmp/pykvm.debug.log")
     args = parser.parse_args()
 
@@ -225,7 +207,7 @@ def main() -> None:
         root.addHandler(fh)
         log.info("Debug event log → /tmp/pykvm.debug.log")
 
-    cfg = ClientConfig(server_host=args.server, server_port=args.port)
+    cfg = ClientConfig(server_host=args.server, server_port=args.port, psk=args.psk)
     try:
         asyncio.run(run(cfg))
     except KeyboardInterrupt:

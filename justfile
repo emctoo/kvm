@@ -62,11 +62,11 @@ test-vm:
 
 # Run pykvm-server; pass extra flags after --  e.g. `just server -- --port 5901`
 server *args:
-    pykvm-server {{ args }}
+    pykvm-server --psk "my-secret" {{ args }}
 
 # Run pykvm-client; pass --server HOST and any other flags after --
 client *args:
-    pykvm-client {{ args }}
+    pykvm-client --psk "my-secret" {{ args }}
 
 # ── dev client VM (SSH on localhost:2222) ─────────────────────────────────────
 # Shared SSH flags: no host-key checking (VM regenerates keys each boot).
@@ -99,7 +99,7 @@ vm-ssh:
 
 # Override for a remote server:  just vm-run-client 192.168.9.34
 vm-run-client server="10.0.2.2" *args:
-    {{ _vm_ssh }} -t "pykvm-client --server {{ server }} --port 5900 --debug {{ args }}"
+    {{ _vm_ssh }} -t "pykvm-client --server {{ server }} --port 5900 --psk "my-secret" --debug {{ args }}"
 
 # ── dev desktop VM ────────────────────────────────────────────────────────────
 # VM_HOST controls where the QEMU process runs (default: localhost).
@@ -154,7 +154,7 @@ vm-dev-desktop-ssh:
 # just vm-dev-desktop-run 192.168.9.34
 vm-dev-desktop-run server="10.0.2.2" *args:
     just vm-dev-desktop-sync
-    {{ _d_ssh }} root@{{ vm_host }} -t "pykvm-client --server {{ server }} --port 5900 --debug {{ args }}"
+    {{ _d_ssh }} root@{{ vm_host }} -t "pykvm-client --server {{ server }} --port 5900 --psk "my-secret" --debug {{ args }}"
 
 # ── VM testing ────────────────────────────────────────────────────────────────
 

@@ -20,9 +20,13 @@ class ServerConfig:
     # Patterns matched against device names (case-insensitive substring) or
     # exact /dev/input/eventN paths (when the pattern starts with '/').
     ignore_devices: frozenset[str] = field(default_factory=frozenset)
+    # Pre-shared key for client authentication.  None = no authentication.
+    psk: str | None = None
 
 
 @dataclass
 class ClientConfig:
     server_host: str = "127.0.0.1"
     server_port: int = DEFAULT_PORT
+    # Pre-shared key.  Must match the server's PSK (or None if server has none).
+    psk: str | None = None

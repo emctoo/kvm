@@ -502,14 +502,35 @@ async def run(cfg: ServerConfig) -> None:
     # ── TCP server ───────────────────────────────────────────────────────────
     async def _handle_client(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         nonlocal current
+        addr = w.get_extra_info("peername")
+        _apply_keepalive(w.get_extra_info("socket"))
+
+        # ── PSK authentication ────────────────────────────────────────────
+        try:
+            token = await asyncio.wait_for(r.readexactly(protocol.AUTH_TOKEN_SIZE), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, OSError):
+            w.close()
+            return
+        accepted = cfg.psk is None or token == protocol.make_auth_token(cfg.psk)
+        try:
+            w.write(protocol.pack_auth_response(accepted))
+            await w.drain()
+        except OSError:
+            w.close()
+            return
+        if not accepted:
+            log.warning("Rejected client from %s (wrong PSK)", addr)
+            w.close()
+            await w.wait_closed()
+            return
+
+        # ── assign slot ───────────────────────────────────────────────────
         # Assign the smallest available slot ≥ 1 so that keys stay stable
         # across reconnects (slot 1 is always reused once it's free).
         slot = 1
         while slot in clients:
             slot += 1
         clients[slot] = w
-        addr = w.get_extra_info("peername")
-        _apply_keepalive(w.get_extra_info("socket"))
         mods_names = "+".join(_key_name(c) for c in sorted(cfg.switch_mods))
         log.info("Client %d connected from %s  →  press %s+%d to switch", slot, addr, mods_names, slot + 1)
         try:
@@ -610,6 +631,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--psk",
+        metavar="SECRET",
+        default=None,
+        help="Pre-shared key: clients must send the matching token or be rejected. Omit to allow unauthenticated connections.",
+    )
+    parser.add_argument(
         "--debug",
         "-v",
         action="store_true",
@@ -631,7 +658,7 @@ def main() -> None:
         root.addHandler(fh)
         log.info("Debug key log → /tmp/pykvm.debug.log")
 
-    conf = ServerConfig(host=args.host, port=args.port, switch_mods=args.switch_mods, ignore_devices=frozenset(args.ignore_devices))
+    conf = ServerConfig(host=args.host, port=args.port, switch_mods=args.switch_mods, ignore_devices=frozenset(args.ignore_devices), psk=args.psk)
     try:
         asyncio.run(run(conf))
     except KeyboardInterrupt:

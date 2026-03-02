@@ -1,5 +1,6 @@
 """Unit tests for the wire protocol."""
 
+import hashlib
 import struct
 
 import pytest
@@ -71,3 +72,44 @@ def test_rawevent_is_named_tuple():
 def test_unpack_wrong_length_raises():
     with pytest.raises(struct.error):
         protocol.unpack(b"\x00" * 7)
+
+
+# ── authentication ────────────────────────────────────────────────────────────
+
+
+def test_auth_token_size():
+    assert protocol.AUTH_TOKEN_SIZE == 32
+
+
+def test_make_auth_token_no_psk_is_zeros():
+    token = protocol.make_auth_token(None)
+    assert token == b"\x00" * 32
+
+
+def test_make_auth_token_is_sha256():
+    token = protocol.make_auth_token("secret")
+    assert token == hashlib.sha256(b"secret").digest()
+
+
+def test_make_auth_token_length():
+    assert len(protocol.make_auth_token("hello")) == protocol.AUTH_TOKEN_SIZE
+
+
+def test_pack_auth_response_accepted():
+    assert protocol.pack_auth_response(True) == b"\x01"
+
+
+def test_pack_auth_response_rejected():
+    assert protocol.pack_auth_response(False) == b"\x00"
+
+
+def test_unpack_auth_response_ok():
+    assert protocol.unpack_auth_response(b"\x01") is True
+
+
+def test_unpack_auth_response_reject():
+    assert protocol.unpack_auth_response(b"\x00") is False
+
+
+def test_different_psks_produce_different_tokens():
+    assert protocol.make_auth_token("abc") != protocol.make_auth_token("xyz")

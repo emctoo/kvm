@@ -1,7 +1,12 @@
 """
 Wire protocol.
 
-Capability handshake (sent by server immediately on connect)
+Authentication (client → server, then server → client)
+-------------------------------------------------------
+  auth_token : 32 bytes — SHA-256(PSK).  All-zero bytes when no PSK is configured.
+  auth_result:  1 byte  — 0x01 = accepted, 0x00 = rejected (server closes connection).
+
+Capability handshake (sent by server after successful auth)
 ------------------------------------------------------------
   caps_len : u32 big-endian — byte length of the JSON that follows
   caps_body: UTF-8 JSON     — serialised touchpad capabilities, or absent if caps_len == 0
@@ -21,9 +26,29 @@ EV_SYN events are included so the client can flush properly.
 Timestamps are dropped; the client synthesises them on injection.
 """
 
+import hashlib
 import json
 import struct
 from typing import NamedTuple
+
+# ── authentication ───────────────────────────────────────────────────────────
+AUTH_TOKEN_SIZE = 32  # SHA-256 digest length in bytes
+
+
+def make_auth_token(psk: str | None) -> bytes:
+    """Return the 32-byte auth token: SHA-256(PSK), or all-zeros if *psk* is None."""
+    if psk is None:
+        return b"\x00" * AUTH_TOKEN_SIZE
+    return hashlib.sha256(psk.encode()).digest()
+
+
+def pack_auth_response(accepted: bool) -> bytes:
+    return b"\x01" if accepted else b"\x00"
+
+
+def unpack_auth_response(data: bytes) -> bool:
+    return data == b"\x01"
+
 
 # ── capability handshake ─────────────────────────────────────────────────────
 _CAPS_HDR_FMT = "!I"  # u32 big-endian
