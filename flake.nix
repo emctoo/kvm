@@ -102,7 +102,19 @@
       #   .config.build.wrapper  — the `treefmt` binary with config baked in
       #   .config.build.check    — a derivation that fails if files are unformatted
       treefmtEval = forAllSystems (
-        system: treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} ./treefmt.nix
+        system:
+        treefmt-nix.lib.evalModule nixpkgs.legacyPackages.${system} {
+          projectRootFile = "flake.nix";
+
+          # Nix — RFC 166 style (pkgs.nixfmt is now the RFC-style formatter)
+          programs.nixfmt.enable = true;
+
+          # Python — ruff formatter (replaces black)
+          programs.ruff-format.enable = true;
+
+          # Justfile
+          programs.just.enable = true;
+        }
       );
 
       # ── Pre-commit hooks (git-hooks.nix) ─────────────────────────────────
