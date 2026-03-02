@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     const evdev_dep = b.dependency("evdev", .{ .target = target, .optimize = optimize });
-    const xev_dep   = b.dependency("libxev", .{ .target = target, .optimize = optimize });
+    const xev_dep = b.dependency("libxev", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "kvm",
@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     exe.root_module.addImport("evdev", evdev_dep.module("evdev"));
-    exe.root_module.addImport("xev",   xev_dep.module("xev"));
+    exe.root_module.addImport("xev", xev_dep.module("xev"));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -31,13 +31,13 @@ pub fn build(b: *std.Build) !void {
 
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     exe_tests.root_module.addImport("evdev", evdev_dep.module("evdev"));
-    exe_tests.root_module.addImport("xev",   xev_dep.module("xev"));
+    exe_tests.root_module.addImport("xev", xev_dep.module("xev"));
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
