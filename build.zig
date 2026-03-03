@@ -19,6 +19,30 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("xev", xev_dep.module("xev"));
     b.installArtifact(exe);
 
+    const kvm_server = b.addExecutable(.{
+        .name = "pykvm-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    kvm_server.root_module.addImport("evdev", evdev_dep.module("evdev"));
+    kvm_server.root_module.addImport("xev", xev_dep.module("xev"));
+    b.installArtifact(kvm_server);
+
+    const kvm_client = b.addExecutable(.{
+        .name = "pykvm-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    kvm_client.root_module.addImport("evdev", evdev_dep.module("evdev"));
+    kvm_client.root_module.addImport("xev", xev_dep.module("xev"));
+    b.installArtifact(kvm_client);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

@@ -62,11 +62,13 @@ test-vm:
 
 # Run pykvm-server; pass extra flags after --  e.g. `just server -- --port 5901`
 server *args:
-    pykvm-server --psk "my-secret" {{ args }}
+    # pykvm-server --psk "my-secret" {{ args }}
+    ./zig-out/bin/pykvm-server --psk "my-secret" --debug {{ args }}
 
 # Run pykvm-client; pass --server HOST and any other flags after --
 client *args:
     pykvm-client --psk "my-secret" {{ args }}
+    # ./zig-out/bin/pykvm-client --psk "my-secret" --debug {{ args }}
 
 # ── dev client VM (SSH on localhost:2222) ─────────────────────────────────────
 # Shared SSH flags: no host-key checking (VM regenerates keys each boot).
@@ -143,6 +145,9 @@ vm-dev-desktop-sync:
     {{ _d_ssh }} root@{{ vm_host }} mkdir -p /root/pykvm/src
     rsync -avz --delete -e "{{ _d_ssh }}" src/ root@{{ vm_host }}:/root/pykvm/src/
 
+    # copy zig version to /root/
+    rsync -avz --delete -e "{{ _d_ssh }}" zig-out/bin/pykvm-client root@{{ vm_host }}:/root/
+
 # Open a root shell inside the running VM.
 vm-dev-desktop-ssh:
     {{ _d_ssh }} root@{{ vm_host }}
@@ -154,7 +159,8 @@ vm-dev-desktop-ssh:
 # just vm-dev-desktop-run 192.168.9.34
 vm-dev-desktop-run server="10.0.2.2" *args:
     just vm-dev-desktop-sync
-    {{ _d_ssh }} root@{{ vm_host }} -t "pykvm-client --server {{ server }} --port 5900 --psk "my-secret" --debug {{ args }}"
+    {{ _d_ssh }} root@{{ vm_host }} -t 'pykvm-client --server {{ server }} --port 5900 --psk "my-secret" --debug {{ args }}'
+    # {{ _d_ssh }} root@{{ vm_host }} -t '/root/pykvm-client --server {{ server }} --port 5900 --psk "my-secret" --debug {{ args }}'
 
 # ── VM testing ────────────────────────────────────────────────────────────────
 

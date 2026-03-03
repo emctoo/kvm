@@ -346,39 +346,39 @@ pub fn build(b: *std.Build) !void {
 
 ### Phase 1 — 设备层（evdev 封装）
 
-- [ ] 实现 `list_devices()` — 扫描 `/dev/input/event*`
-- [ ] 封装 `Device.open` + `grab` / `ungrab` / `close`
-- [ ] 实现设备分类检测（keyboard / mouse / touchpad）
-- [ ] 实现 `getCapabilitiesJson()` — 将设备能力序列化为 JSON（供 client 端重建触摸板）
+- [x] 实现 `list_devices()` — 扫描 `/dev/input/event*`
+- [x] 封装 `Device.open` + `grab` / `ungrab` / `close`
+- [x] 实现设备分类检测（keyboard / mouse / touchpad）
+- [x] 实现 `getCapabilitiesJson()` — 将设备能力序列化为 JSON（供 client 端重建触摸板）
 
 ### Phase 2 — 虚拟设备层（uinput）
 
-- [ ] 实现 `createVirtualKeyboard()` — 使用 `VirtualDevice.Builder`
-- [ ] 实现 `createVirtualMouse()` — 含 `INPUT_PROP_POINTER` + REL 轴 + 鼠标按钮
-- [ ] 实现 `createVirtualTouchpad(src: Device)` — 使用 `Builder.copyCapabilities`
-- [ ] 实现 `createVirtualTouchpadFromJson(json: []const u8)` — client 端重建触摸板
-- [ ] 实现 `VirtualDevice.writeEvent` 封装（含 EV_SYN 刷新）
+- [x] 实现 `createVirtualKeyboard()` — 使用 `VirtualDevice.Builder`
+- [x] 实现 `createVirtualMouse()` — 含 `INPUT_PROP_POINTER` + REL 轴 + 鼠标按钮
+- [x] 实现 `createVirtualTouchpad(src: Device)` — 使用 `Builder.copyCapabilities`
+- [x] 实现 `createVirtualTouchpadFromJson(json: []const u8)` — client 端重建触摸板
+- [x] 实现 `VirtualDevice.writeEvent` 封装（含 EV_SYN 刷新）
 
 ### Phase 3 — 事件循环与多路复用
 
-- [ ] 实现基于 **libxev** 的多设备事件读取循环（替代 `async_read_loop()`）
-- [ ] 实现 held_keys 追踪（`EV_KEY` down/up 状态维护）
-- [ ] 实现 slot-switch 热键检测（`switch_mods + digit`）
-- [ ] 实现 stuck key 释放（slot 切换时向 outgoing target 合成 key-up 序列）
+- [x] 实现基于 **libxev** 的多设备事件读取循环（替代 `async_read_loop()`）
+- [x] 实现 held_keys 追踪（`EV_KEY` down/up 状态维护）
+- [x] 实现 slot-switch 热键检测（`switch_mods + digit`）
+- [x] 实现 stuck key 释放（slot 切换时向 outgoing target 合成 key-up 序列）
 
 ### Phase 4 — Hot-plug 监控
 
-- [ ] 实现 `/dev/input/` 目录变化监控（`inotify` 或 1s 轮询）
-- [ ] 实现热插拔设备的自动 grab
-- [ ] 实现设备拔出时的 task 清理与 ungrab
+- [x] 实现 `/dev/input/` 目录变化监控（`inotify` 或 1s 轮询）
+- [x] 实现热插拔设备的自动 grab
+- [x] 实现设备拔出时的 task 清理与 ungrab
 
 ### Phase 5 — TCP 协议层
 
-- [ ] 实现 `makeAuthToken(psk)` — SHA-256(PSK) 或全零
-- [ ] 实现 `packCaps(caps)` / `unpackCaps(data)` — u32 BE length + JSON body
-- [ ] 实现 8-byte 事件打包 `packEvent` / `unpackEvent`（type:u16 + code:u16 + value:i32, BE）
-- [ ] 实现 TCP server：accept → auth → caps handshake → event stream
-- [ ] 实现 TCP client：connect → auth → caps handshake → uinput 注入 + 指数退避重连
+- [x] 实现 `makeAuthToken(psk)` — SHA-256(PSK) 或全零
+- [x] 实现 `packCaps(caps)` / `unpackCaps(data)` — u32 BE length + JSON body
+- [x] 实现 8-byte 事件打包 `packEvent` / `unpackEvent`（type:u16 + code:u16 + value:i32, BE）
+- [x] 实现 TCP server：accept → auth → caps handshake → event stream
+- [x] 实现 TCP client：connect → auth → caps handshake → uinput 注入 + 指数退避重连
 
 ### Phase 6 — 集成与测试
 
